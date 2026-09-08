@@ -37,7 +37,7 @@ const supabase = createClient(supabaseUrl, supabaseKey, {
 });
 
 // Brevo API Configuration
-const BREVO_API_KEY = process.env.BREVO_API_KEY || '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';
+const BREVO_API_KEY = process.env.BREVO_API_KEY || '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';
 const BREVO_FROM_EMAIL = process.env.BREVO_FROM_EMAIL || 'AAGS<louisphatt@gmail.com>';
 const BREVO_FROM_NAME = 'AAGS';
 

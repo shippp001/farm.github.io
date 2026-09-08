@@ -1,6 +1,8 @@
 // ============================================================
-// server.js - Main Express Server (Using Brevo REST API)
+// server.js - AAGS Backend Server
+// Environment: Production-ready
 // ============================================================
+
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -15,19 +17,34 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 // ============================================================
+// ENVIRONMENT VALIDATION
+// ============================================================
+const requiredEnvVars = [
+    'SUPABASE_URL',
+    'SUPABASE_SERVICE_KEY',
+    'JWT_SECRET',
+    'BREVO_API_KEY',
+    'BREVO_FROM_EMAIL'
+];
+
+const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
+
+if (missingVars.length > 0) {
+    console.error('❌ Missing required environment variables:');
+    missingVars.forEach(varName => console.error(`   - ${varName}`));
+    console.error('\n⚠️  Please set these variables in your .env file or Render dashboard.');
+    process.exit(1);
+}
+
+// ============================================================
 // CONFIGURATION
 // ============================================================
-const JWT_SECRET = process.env.JWT_SECRET || 'your-super-secret-jwt-key-change-this-in-production';
+const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_EXPIRY = '7d';
 
 // Supabase
 const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_ANON_KEY;
-
-if (!supabaseUrl || !supabaseKey) {
-    console.error('❌ ERROR: Supabase URL or Key not set in environment variables!');
-    process.exit(1);
-}
+const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
 
 const supabase = createClient(supabaseUrl, supabaseKey, {
     auth: {
@@ -37,19 +54,29 @@ const supabase = createClient(supabaseUrl, supabaseKey, {
 });
 
 // Brevo API Configuration
-const BREVO_API_KEY = process.env.BREVO_API_KEY || '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';
-const BREVO_FROM_EMAIL = process.env.BREVO_FROM_EMAIL || 'AAGS<suppout.chimee@gmail.com>';
-const BREVO_FROM_NAME = 'AAGS';
+const BREVO_API_KEY = process.env.BREVO_API_KEY;
+const BREVO_FROM_EMAIL = process.env.BREVO_FROM_EMAIL;
+const BREVO_FROM_NAME = process.env.BREVO_FROM_NAME || 'AAGS';
 
-console.log('📧 Brevo API Key:', BREVO_API_KEY ? '✅ Set' : '❌ Not Set');
-console.log('📧 Brevo From Email:', BREVO_FROM_EMAIL);
+console.log('📧 Brevo API Key:', BREVO_API_KEY ? '✅ Configured' : '❌ Not Set');
+console.log('📧 Brevo From Email:', BREVO_FROM_EMAIL || '❌ Not Set');
 
 // Configure Brevo API
-const defaultClient = SibApiV3Sdk.ApiClient.instance;
-const apiKey = defaultClient.authentications['api-key'];
-apiKey.apiKey = BREVO_API_KEY;
+let brevoConfigured = false;
+let apiInstance = null;
 
-const apiInstance = new SibApiV3Sdk.TransactionalEmailsApi();
+try {
+    const defaultClient = SibApiV3Sdk.ApiClient.instance;
+    const apiKeyAuth = defaultClient.authentications['api-key'];
+    apiKeyAuth.apiKey = BREVO_API_KEY;
+    
+    apiInstance = new SibApiV3Sdk.TransactionalEmailsApi();
+    brevoConfigured = true;
+    console.log('✅ Brevo API configured successfully');
+} catch (error) {
+    console.error('❌ Failed to configure Brevo API:', error.message);
+    brevoConfigured = false;
+}
 
 // ============================================================
 // MIDDLEWARE
@@ -244,6 +271,11 @@ async function sendOTPEmail(email, otpCode, userName) {
     try {
         console.log('📧 Sending OTP to:', email);
         
+        if (!brevoConfigured || !apiInstance) {
+            console.error('❌ Brevo API not configured properly');
+            return { success: false, error: 'Email service not configured' };
+        }
+
         const sendSmtpEmail = new SibApiV3Sdk.SendSmtpEmail();
         
         sendSmtpEmail.subject = 'Verify Your AAGS Account';
@@ -296,8 +328,16 @@ async function sendOTPEmail(email, otpCode, userName) {
         
     } catch (error) {
         console.error('❌ Brevo API error:', error);
-        console.error('Error details:', error.response?.body || error.message);
-        return { success: false, error: error.message };
+        
+        let errorMessage = error.message;
+        if (error.response?.body) {
+            console.error('Error details:', error.response.body);
+            if (error.response.body.message) {
+                errorMessage = error.response.body.message;
+            }
+        }
+        
+        return { success: false, error: errorMessage };
     }
 }
 
@@ -370,7 +410,7 @@ app.get('/api/health', (req, res) => {
         environment: process.env.NODE_ENV || 'development',
         services: {
             supabase: supabaseUrl ? 'connected' : 'disconnected',
-            brevo: BREVO_API_KEY ? 'configured' : 'not configured'
+            brevo: brevoConfigured ? 'configured' : 'not configured'
         }
     });
 });
@@ -453,7 +493,7 @@ app.post('/api/auth/signup', async (req, res) => {
             expiresAt: expiresAt.toISOString()
         });
 
-        // Send OTP email via Brevo API
+        // Send OTP email
         const userName = `${firstName} ${lastName}`;
         const emailResult = await sendOTPEmail(email, otpCode, userName);
 
@@ -897,13 +937,12 @@ app.use((err, req, res, next) => {
 // ============================================================
 app.listen(PORT, () => {
     console.log('========================================');
-    console.log('🚀 AAGS Backend Server Running');
+    console.log('🚀 AAGS Backend Server');
     console.log(`📍 Port: ${PORT}`);
     console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`🔐 JWT Secret: ${JWT_SECRET ? '✅ Set' : '❌ Not Set'}`);
-    console.log(`📧 Brevo API: ${BREVO_API_KEY ? '✅ Configured' : '❌ Not Configured'}`);
+    console.log(`🔐 JWT: ${JWT_SECRET ? '✅ Configured' : '❌ Not Set'}`);
+    console.log(`📧 Brevo: ${BREVO_API_KEY ? '✅ Configured' : '❌ Not Set'}`);
     console.log(`🗄️  Supabase: ${supabaseUrl ? '✅ Connected' : '❌ Not Connected'}`);
-    console.log(`🌐 Health Check: https://farm-aagsgithub-io.onrender.com/api/health`);
     console.log('========================================');
 });
 

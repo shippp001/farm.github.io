@@ -1,5 +1,5 @@
 // ============================================================
-// server.js - Main Express Server (UPDATED)
+// server.js - Main Express Server (Using Brevo REST API)
 // ============================================================
 const express = require('express');
 const cors = require('cors');
@@ -8,8 +8,7 @@ const rateLimit = require('express-rate-limit');
 const { createClient } = require('@supabase/supabase-js');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const crypto = require('crypto');
-const nodemailer = require('nodemailer');
+const SibApiV3Sdk = require('sib-api-v3-sdk');
 require('dotenv').config();
 
 const app = express();
@@ -30,26 +29,31 @@ if (!supabaseUrl || !supabaseKey) {
     process.exit(1);
 }
 
-const supabase = createClient(supabaseUrl, supabaseKey);
-
-// Brevo Email (via SMTP)
-const emailConfig = {
-    host: process.env.BREVO_HOST || 'smtp-relay.brevo.com',
-    port: parseInt(process.env.BREVO_PORT) || 587,
-    secure: false,
+const supabase = createClient(supabaseUrl, supabaseKey, {
     auth: {
-        user: process.env.BREVO_USER || 'your-brevo-email@example.com',
-        pass: process.env.BREVO_PASS || 'your-brevo-smtp-key'
+        autoRefreshToken: false,
+        persistSession: false
     }
-};
+});
 
-const transporter = nodemailer.createTransport(emailConfig);
+// Brevo API Configuration
+const BREVO_API_KEY = process.env.BREVO_API_KEY || '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';
+const BREVO_FROM_EMAIL = process.env.BREVO_FROM_EMAIL || 'louisphatt@gmail.com';
+const BREVO_FROM_NAME = 'AAGS';
+
+console.log('📧 Brevo API Key:', BREVO_API_KEY ? '✅ Set' : '❌ Not Set');
+console.log('📧 Brevo From Email:', BREVO_FROM_EMAIL);
+
+// Configure Brevo API
+const defaultClient = SibApiV3Sdk.ApiClient.instance;
+const apiKey = defaultClient.authentications['api-key'];
+apiKey.apiKey = BREVO_API_KEY;
+
+const apiInstance = new SibApiV3Sdk.TransactionalEmailsApi();
 
 // ============================================================
 // MIDDLEWARE
 // ============================================================
-
-// Security headers
 app.use(helmet({
     contentSecurityPolicy: {
         directives: {
@@ -63,38 +67,8 @@ app.use(helmet({
     },
 }));
 
-// CORS - Allow multiple origins
-const allowedOrigins = [
-    'http://localhost:3000',
-    'http://localhost:5500',
-    'http://127.0.0.1:3000',
-    'http://127.0.0.1:5500',
-    'https://*.netlify.app',
-    'https://*.netlify.com',
-    process.env.FRONTEND_URL
-].filter(Boolean);
-
 app.use(cors({
-    origin: function(origin, callback) {
-        // Allow requests with no origin (like mobile apps or curl requests)
-        if (!origin) return callback(null, true);
-        
-        // Check if origin matches any allowed pattern
-        const isAllowed = allowedOrigins.some(pattern => {
-            if (pattern.includes('*')) {
-                const regex = new RegExp('^' + pattern.replace(/\*/g, '.*') + '$');
-                return regex.test(origin);
-            }
-            return pattern === origin;
-        });
-        
-        if (isAllowed) {
-            callback(null, true);
-        } else {
-            console.warn('CORS blocked origin:', origin);
-            callback(null, true); // Allow anyway for development
-        }
-    },
+    origin: true,
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
@@ -111,13 +85,12 @@ app.use((req, res, next) => {
 
 // Rate limiting
 const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 100, // Limit each IP to 100 requests per windowMs
+    windowMs: 15 * 60 * 1000,
+    max: 100,
     message: 'Too many requests from this IP, please try again later.'
 });
 app.use('/api/', limiter);
 
-// Stricter rate limit for auth endpoints
 const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 20,
@@ -131,6 +104,8 @@ app.use('/api/auth/', authLimiter);
 const db = {
     users: {
         async create(userData) {
+            console.log('📝 Creating user:', userData.email);
+            
             const { data, error } = await supabase
                 .from('users')
                 .insert([{
@@ -150,7 +125,12 @@ const db = {
                 .select()
                 .single();
 
-            if (error) throw new Error(`Supabase insert error: ${error.message}`);
+            if (error) {
+                console.error('❌ Supabase insert error:', error);
+                throw new Error(`Supabase insert error: ${error.message}`);
+            }
+            
+            console.log('✅ User created successfully:', data.id);
             return data;
         },
 
@@ -258,57 +238,66 @@ const db = {
 };
 
 // ============================================================
-// EMAIL SERVICE (Brevo)
+// EMAIL SERVICE (Brevo REST API)
 // ============================================================
 async function sendOTPEmail(email, otpCode, userName) {
     try {
-        // Verify transporter connection
-        await transporter.verify();
+        console.log('📧 Sending OTP to:', email);
         
-        const mailOptions = {
-            from: process.env.BREVO_FROM_EMAIL || 'noreply@aags.org',
-            to: email,
-            subject: 'Verify Your AAGS Account',
-            html: `
-                <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background-color: #f7f4f0; border-radius: 12px;">
-                    <div style="background-color: #ffffff; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08);">
-                        <div style="text-align: center; margin-bottom: 20px;">
-                            <h1 style="color: #1a4a3a; font-size: 28px; margin: 0;">AAGS<span style="color: #c6a15b;">.</span></h1>
-                            <p style="color: #5a6b6b; margin: 5px 0 0;">American Agricultural Grant Services</p>
-                        </div>
-                        <h2 style="color: #1a4a3a; font-size: 22px; text-align: center;">Verify Your Email Address</h2>
-                        <p style="color: #1e2b2b; font-size: 16px; line-height: 1.6;">
-                            Hello ${userName || 'there'},
-                        </p>
-                        <p style="color: #1e2b2b; font-size: 16px; line-height: 1.6;">
-                            Thank you for signing up for AAGS. Please use the verification code below to complete your registration:
-                        </p>
-                        <div style="text-align: center; margin: 30px 0;">
-                            <div style="display: inline-block; background-color: #f7f2e9; padding: 15px 40px; border-radius: 8px; font-size: 32px; font-weight: 700; letter-spacing: 8px; color: #1a4a3a; border: 2px solid #c6a15b;">
-                                ${otpCode}
-                            </div>
-                        </div>
-                        <p style="color: #5a6b6b; font-size: 14px; text-align: center;">
-                            This code will expire in 15 minutes.
-                        </p>
-                        <p style="color: #5a6b6b; font-size: 14px; text-align: center; margin-top: 20px;">
-                            If you didn't create an account with AAGS, please ignore this email.
-                        </p>
-                        <hr style="border: none; border-top: 1px solid #e9ecec; margin: 20px 0;">
-                        <p style="color: #5a6b6b; font-size: 12px; text-align: center;">
-                            &copy; 2026 American Agricultural Grant Services. All rights reserved.
-                        </p>
+        const sendSmtpEmail = new SibApiV3Sdk.SendSmtpEmail();
+        
+        sendSmtpEmail.subject = 'Verify Your AAGS Account';
+        sendSmtpEmail.htmlContent = `
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background-color: #f7f4f0; border-radius: 12px;">
+                <div style="background-color: #ffffff; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08);">
+                    <div style="text-align: center; margin-bottom: 20px;">
+                        <h1 style="color: #1a4a3a; font-size: 28px; margin: 0;">AAGS<span style="color: #c6a15b;">.</span></h1>
+                        <p style="color: #5a6b6b; margin: 5px 0 0;">American Agricultural Grant Services</p>
                     </div>
+                    <h2 style="color: #1a4a3a; font-size: 22px; text-align: center;">Verify Your Email Address</h2>
+                    <p style="color: #1e2b2b; font-size: 16px; line-height: 1.6;">
+                        Hello ${userName || 'there'},
+                    </p>
+                    <p style="color: #1e2b2b; font-size: 16px; line-height: 1.6;">
+                        Thank you for signing up for AAGS. Please use the verification code below to complete your registration:
+                    </p>
+                    <div style="text-align: center; margin: 30px 0;">
+                        <div style="display: inline-block; background-color: #f7f2e9; padding: 15px 40px; border-radius: 8px; font-size: 32px; font-weight: 700; letter-spacing: 8px; color: #1a4a3a; border: 2px solid #c6a15b;">
+                            ${otpCode}
+                        </div>
+                    </div>
+                    <p style="color: #5a6b6b; font-size: 14px; text-align: center;">
+                        This code will expire in 15 minutes.
+                    </p>
+                    <p style="color: #5a6b6b; font-size: 14px; text-align: center; margin-top: 20px;">
+                        If you didn't create an account with AAGS, please ignore this email.
+                    </p>
+                    <hr style="border: none; border-top: 1px solid #e9ecec; margin: 20px 0;">
+                    <p style="color: #5a6b6b; font-size: 12px; text-align: center;">
+                        &copy; 2026 American Agricultural Grant Services. All rights reserved.
+                    </p>
                 </div>
-            `
+            </div>
+        `;
+        
+        sendSmtpEmail.sender = { 
+            name: BREVO_FROM_NAME, 
+            email: BREVO_FROM_EMAIL 
         };
+        
+        sendSmtpEmail.to = [{ 
+            email: email, 
+            name: userName || 'User' 
+        }];
 
-        const info = await transporter.sendMail(mailOptions);
-        console.log('✅ OTP email sent:', info.messageId);
-        return { success: true, messageId: info.messageId };
+        const response = await apiInstance.sendTransacEmail(sendSmtpEmail);
+        console.log('✅ OTP email sent via Brevo API:', response.messageId);
+        return { success: true, messageId: response.messageId };
+        
     } catch (error) {
-        console.error('❌ Email send error:', error);
-        throw new Error('Failed to send verification email');
+        console.error('❌ Brevo API error:', error);
+        console.error('Error details:', error.response?.body || error.message);
+        return { success: false, error: error.message };
     }
 }
 
@@ -372,47 +361,34 @@ function authenticateToken(req, res, next) {
 // API ROUTES
 // ============================================================
 
-// ===== HEALTH CHECK =====
+// HEALTH CHECK
 app.get('/api/health', (req, res) => {
     res.json({
         success: true,
         status: 'healthy',
         timestamp: new Date().toISOString(),
         environment: process.env.NODE_ENV || 'development',
-        uptime: process.uptime(),
-        version: '1.0.0',
         services: {
             supabase: supabaseUrl ? 'connected' : 'disconnected',
-            email: emailConfig.auth.user ? 'configured' : 'not configured'
+            brevo: BREVO_API_KEY ? 'configured' : 'not configured'
         }
     });
 });
 
-// Root endpoint for testing
 app.get('/', (req, res) => {
     res.json({
         message: 'AAGS Backend API',
         version: '1.0.0',
         endpoints: {
             health: '/api/health',
-            auth: {
-                signup: 'POST /api/auth/signup',
-                login: 'POST /api/auth/login',
-                verifyOtp: 'POST /api/auth/verify-otp',
-                resendOtp: 'POST /api/auth/resend-otp',
-                verifyToken: 'POST /api/auth/verify-token'
-            },
-            user: {
-                profile: 'GET /api/user/me',
-                update: 'PUT /api/user/profile',
-                changePassword: 'POST /api/user/change-password'
-            }
-        },
-        docs: 'https://farm-aagsgithub-io.onrender.com/api/health'
+            signup: 'POST /api/auth/signup',
+            login: 'POST /api/auth/login',
+            verifyOtp: 'POST /api/auth/verify-otp',
+            resendOtp: 'POST /api/auth/resend-otp',
+            verifyToken: 'POST /api/auth/verify-token'
+        }
     });
 });
-
-// ===== AUTH ROUTES =====
 
 // SIGNUP
 app.post('/api/auth/signup', async (req, res) => {
@@ -468,7 +444,7 @@ app.post('/api/auth/signup', async (req, res) => {
 
         // Generate OTP
         const otpCode = generateOTP();
-        const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+        const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
 
         // Save OTP
         await db.otps.create({
@@ -477,25 +453,26 @@ app.post('/api/auth/signup', async (req, res) => {
             expiresAt: expiresAt.toISOString()
         });
 
-        console.log(`📧 Sending OTP to: ${email}`);
-
-        // Send OTP email via Brevo
+        // Send OTP email via Brevo API
         const userName = `${firstName} ${lastName}`;
-        await sendOTPEmail(email, otpCode, userName);
+        const emailResult = await sendOTPEmail(email, otpCode, userName);
 
-        // Generate JWT token (for auto-login after verification)
+        // Generate JWT token
         const token = generateToken(user);
 
         // Return success
         res.status(201).json({
             success: true,
-            message: 'User created successfully. Please verify your email with the OTP sent.',
+            message: emailResult.success 
+                ? 'User created successfully. Please verify your email with the OTP sent.'
+                : 'User created successfully. Please check your email for the OTP (if you don\'t see it, check spam).',
             data: {
                 userId: user.id,
                 email: user.email,
                 name: `${user.first_name} ${user.last_name}`,
                 token: token,
-                isVerified: false
+                isVerified: false,
+                otpCode: process.env.NODE_ENV === 'development' ? otpCode : undefined
             }
         });
 
@@ -523,7 +500,6 @@ app.post('/api/auth/verify-otp', async (req, res) => {
             });
         }
 
-        // Find valid OTP
         const otpRecord = await db.otps.findValid(email, otpCode);
 
         if (!otpRecord) {
@@ -533,7 +509,6 @@ app.post('/api/auth/verify-otp', async (req, res) => {
             });
         }
 
-        // Find user
         const user = await db.users.findByEmail(email);
         if (!user) {
             return res.status(404).json({
@@ -542,13 +517,9 @@ app.post('/api/auth/verify-otp', async (req, res) => {
             });
         }
 
-        // Mark OTP as used
         await db.otps.markUsed(otpRecord.id);
-
-        // Verify user
         await db.users.verifyUser(user.id);
 
-        // Generate new token after verification
         const token = generateToken(user);
 
         console.log(`✅ User verified: ${email}`);
@@ -589,7 +560,6 @@ app.post('/api/auth/resend-otp', async (req, res) => {
             });
         }
 
-        // Find user
         const user = await db.users.findByEmail(email);
         if (!user) {
             return res.status(404).json({
@@ -605,18 +575,15 @@ app.post('/api/auth/resend-otp', async (req, res) => {
             });
         }
 
-        // Generate new OTP
         const otpCode = generateOTP();
         const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
 
-        // Save OTP
         await db.otps.create({
             email,
             otpCode,
             expiresAt: expiresAt.toISOString()
         });
 
-        // Send OTP email
         const userName = `${user.first_name} ${user.last_name}`;
         await sendOTPEmail(email, otpCode, userName);
 
@@ -649,7 +616,6 @@ app.post('/api/auth/login', async (req, res) => {
             });
         }
 
-        // Find user
         const user = await db.users.findByEmail(email);
         if (!user) {
             return res.status(401).json({
@@ -658,7 +624,6 @@ app.post('/api/auth/login', async (req, res) => {
             });
         }
 
-        // Check password
         const isValid = comparePassword(password, user.password_hash);
         if (!isValid) {
             return res.status(401).json({
@@ -667,11 +632,9 @@ app.post('/api/auth/login', async (req, res) => {
             });
         }
 
-        // Check if verified
         if (!user.is_verified) {
             console.log(`⚠️ User not verified: ${email}`);
 
-            // Generate and send new OTP
             const otpCode = generateOTP();
             const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
 
@@ -692,10 +655,8 @@ app.post('/api/auth/login', async (req, res) => {
             });
         }
 
-        // Generate token
         const token = generateToken(user);
 
-        // Update last login
         await db.users.update(user.id, {
             last_login_at: new Date().toISOString()
         });
@@ -724,9 +685,56 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
-// ===== PROTECTED ROUTES =====
+// VERIFY TOKEN
+app.post('/api/auth/verify-token', async (req, res) => {
+    try {
+        const { token } = req.body;
 
-// GET CURRENT USER
+        if (!token) {
+            return res.status(400).json({
+                success: false,
+                message: 'Token is required'
+            });
+        }
+
+        const decoded = verifyToken(token);
+        if (!decoded) {
+            return res.status(401).json({
+                success: false,
+                message: 'Invalid or expired token'
+            });
+        }
+
+        const user = await db.users.findById(decoded.userId);
+        if (!user) {
+            return res.status(401).json({
+                success: false,
+                message: 'User no longer exists'
+            });
+        }
+
+        res.json({
+            success: true,
+            message: 'Token is valid',
+            data: {
+                userId: decoded.userId,
+                email: decoded.email,
+                name: decoded.name,
+                isVerified: decoded.isVerified
+            }
+        });
+
+    } catch (error) {
+        console.error('❌ Verify token error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to verify token',
+            error: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
+    }
+});
+
+// GET USER
 app.get('/api/user/me', authenticateToken, async (req, res) => {
     try {
         const user = await db.users.findById(req.user.userId);
@@ -765,7 +773,7 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
     }
 });
 
-// UPDATE USER PROFILE
+// UPDATE PROFILE
 app.put('/api/user/profile', authenticateToken, async (req, res) => {
     try {
         const { firstName, middleName, lastName, phone, dateOfBirth, gender, country } = req.body;
@@ -835,7 +843,6 @@ app.post('/api/user/change-password', authenticateToken, async (req, res) => {
             });
         }
 
-        // Verify current password
         const isValid = comparePassword(currentPassword, user.password_hash);
         if (!isValid) {
             return res.status(401).json({
@@ -844,10 +851,8 @@ app.post('/api/user/change-password', authenticateToken, async (req, res) => {
             });
         }
 
-        // Hash new password
         const newPasswordHash = hashPassword(newPassword);
 
-        // Update password
         await db.users.update(user.id, {
             password_hash: newPasswordHash
         });
@@ -862,58 +867,6 @@ app.post('/api/user/change-password', authenticateToken, async (req, res) => {
         res.status(500).json({
             success: false,
             message: 'Failed to change password',
-            error: process.env.NODE_ENV === 'development' ? error.message : undefined
-        });
-    }
-});
-
-// ===== SYSTEM ROUTES =====
-
-// Verify JWT token (for frontend)
-app.post('/api/auth/verify-token', async (req, res) => {
-    try {
-        const { token } = req.body;
-
-        if (!token) {
-            return res.status(400).json({
-                success: false,
-                message: 'Token is required'
-            });
-        }
-
-        const decoded = verifyToken(token);
-        if (!decoded) {
-            return res.status(401).json({
-                success: false,
-                message: 'Invalid or expired token'
-            });
-        }
-
-        // Check if user still exists
-        const user = await db.users.findById(decoded.userId);
-        if (!user) {
-            return res.status(401).json({
-                success: false,
-                message: 'User no longer exists'
-            });
-        }
-
-        res.json({
-            success: true,
-            message: 'Token is valid',
-            data: {
-                userId: decoded.userId,
-                email: decoded.email,
-                name: decoded.name,
-                isVerified: decoded.isVerified
-            }
-        });
-
-    } catch (error) {
-        console.error('❌ Verify token error:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Failed to verify token',
             error: process.env.NODE_ENV === 'development' ? error.message : undefined
         });
     }
@@ -948,13 +901,10 @@ app.listen(PORT, () => {
     console.log(`📍 Port: ${PORT}`);
     console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
     console.log(`🔐 JWT Secret: ${JWT_SECRET ? '✅ Set' : '❌ Not Set'}`);
-    console.log(`📧 Brevo: ${emailConfig.auth.user ? '✅ Configured' : '❌ Not Configured'}`);
+    console.log(`📧 Brevo API: ${BREVO_API_KEY ? '✅ Configured' : '❌ Not Configured'}`);
     console.log(`🗄️  Supabase: ${supabaseUrl ? '✅ Connected' : '❌ Not Connected'}`);
-    console.log(`🌐 Health Check: http://localhost:${PORT}/api/health`);
+    console.log(`🌐 Health Check: https://farm-aagsgithub-io.onrender.com/api/health`);
     console.log('========================================');
 });
 
-// ============================================================
-// EXPORTS FOR TESTING
-// ============================================================
 module.exports = { app, db, generateOTP, hashPassword, comparePassword, generateToken, verifyToken };

@@ -1,6 +1,6 @@
 // ============================================================
 // server.js - AAGS Backend Server
-// Environment: Production-ready
+// User data is only saved AFTER email verification
 // ============================================================
 
 const express = require('express');
@@ -128,10 +128,60 @@ app.use('/api/auth/', authLimiter);
 // ============================================================
 // DATABASE HELPERS (Supabase)
 // ============================================================
+
+// Temporary storage for pending users (before email verification)
+// In production, this should be in Supabase with a cleanup job
+const pendingUsers = new Map(); // email -> { userData, otpCode, expiresAt }
+
 const db = {
+    // Pending users (temporary storage before verification)
+    pendingUsers: {
+        async create(userData) {
+            console.log('📝 Storing pending user:', userData.email);
+            const key = userData.email.toLowerCase();
+            pendingUsers.set(key, {
+                userData: userData,
+                otpCode: userData.otpCode,
+                expiresAt: userData.expiresAt,
+                createdAt: new Date().toISOString()
+            });
+            
+            // Clean up old entries (older than 15 minutes)
+            const now = new Date();
+            for (const [k, v] of pendingUsers.entries()) {
+                if (new Date(v.expiresAt) < now) {
+                    pendingUsers.delete(k);
+                }
+            }
+            
+            return { success: true };
+        },
+
+        async findByEmail(email) {
+            const key = email.toLowerCase();
+            const record = pendingUsers.get(key);
+            if (!record) return null;
+            
+            // Check if expired
+            if (new Date(record.expiresAt) < new Date()) {
+                pendingUsers.delete(key);
+                return null;
+            }
+            
+            return record;
+        },
+
+        async deleteByEmail(email) {
+            const key = email.toLowerCase();
+            pendingUsers.delete(key);
+            return { success: true };
+        }
+    },
+
+    // Users table (only after verification)
     users: {
         async create(userData) {
-            console.log('📝 Creating user:', userData.email);
+            console.log('📝 Creating verified user:', userData.email);
             
             const { data, error } = await supabase
                 .from('users')
@@ -145,7 +195,8 @@ const db = {
                     date_of_birth: userData.dateOfBirth,
                     gender: userData.gender || null,
                     country: userData.country,
-                    is_verified: false,
+                    is_verified: true,
+                    email_verified_at: new Date().toISOString(),
                     created_at: new Date().toISOString(),
                     updated_at: new Date().toISOString()
                 }])
@@ -194,72 +245,6 @@ const db = {
 
             if (error) throw new Error(`Supabase update error: ${error.message}`);
             return data;
-        },
-
-        async verifyUser(id) {
-            const { data, error } = await supabase
-                .from('users')
-                .update({
-                    is_verified: true,
-                    email_verified_at: new Date().toISOString(),
-                    updated_at: new Date().toISOString()
-                })
-                .eq('id', id)
-                .select()
-                .single();
-
-            if (error) throw new Error(`Supabase verify error: ${error.message}`);
-            return data;
-        }
-    },
-
-    otps: {
-        async create(otpData) {
-            const { data, error } = await supabase
-                .from('otps')
-                .insert([{
-                    email: otpData.email,
-                    otp_code: otpData.otpCode,
-                    expires_at: otpData.expiresAt,
-                    is_used: false,
-                    created_at: new Date().toISOString()
-                }])
-                .select()
-                .single();
-
-            if (error) throw new Error(`Supabase OTP insert error: ${error.message}`);
-            return data;
-        },
-
-        async findValid(email, otpCode) {
-            const { data, error } = await supabase
-                .from('otps')
-                .select('*')
-                .eq('email', email)
-                .eq('otp_code', otpCode)
-                .eq('is_used', false)
-                .gt('expires_at', new Date().toISOString())
-                .order('created_at', { ascending: false })
-                .limit(1)
-                .maybeSingle();
-
-            if (error) throw new Error(`Supabase OTP find error: ${error.message}`);
-            return data;
-        },
-
-        async markUsed(id) {
-            const { data, error } = await supabase
-                .from('otps')
-                .update({
-                    is_used: true,
-                    used_at: new Date().toISOString()
-                })
-                .eq('id', id)
-                .select()
-                .single();
-
-            if (error) throw new Error(`Supabase OTP update error: ${error.message}`);
-            return data;
         }
     }
 };
@@ -269,12 +254,25 @@ const db = {
 // ============================================================
 async function sendOTPEmail(email, otpCode, userName) {
     try {
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!email || !emailRegex.test(email)) {
+            console.error('❌ Invalid email address:', email);
+            return { 
+                success: false, 
+                error: 'Invalid email address format',
+                code: 'INVALID_EMAIL'
+            };
+        }
+
         console.log('📧 Sending OTP to:', email);
+        console.log('📧 Sender from:', BREVO_FROM_EMAIL);
         
         if (!brevoConfigured || !apiInstance) {
             console.error('❌ Brevo API not configured properly');
             return { success: false, error: 'Email service not configured' };
         }
+
+        const cleanEmail = email.trim().toLowerCase();
 
         const sendSmtpEmail = new SibApiV3Sdk.SendSmtpEmail();
         
@@ -318,7 +316,7 @@ async function sendOTPEmail(email, otpCode, userName) {
         };
         
         sendSmtpEmail.to = [{ 
-            email: email, 
+            email: cleanEmail, 
             name: userName || 'User' 
         }];
 
@@ -330,14 +328,23 @@ async function sendOTPEmail(email, otpCode, userName) {
         console.error('❌ Brevo API error:', error);
         
         let errorMessage = error.message;
+        let errorCode = null;
+        
         if (error.response?.body) {
             console.error('Error details:', error.response.body);
             if (error.response.body.message) {
                 errorMessage = error.response.body.message;
             }
+            if (error.response.body.code) {
+                errorCode = error.response.body.code;
+            }
         }
         
-        return { success: false, error: errorMessage };
+        return { 
+            success: false, 
+            error: errorMessage,
+            code: errorCode
+        };
     }
 }
 
@@ -422,15 +429,17 @@ app.get('/', (req, res) => {
         endpoints: {
             health: '/api/health',
             signup: 'POST /api/auth/signup',
-            login: 'POST /api/auth/login',
             verifyOtp: 'POST /api/auth/verify-otp',
             resendOtp: 'POST /api/auth/resend-otp',
+            login: 'POST /api/auth/login',
             verifyToken: 'POST /api/auth/verify-token'
         }
     });
 });
 
-// SIGNUP
+// ============================================================
+// SIGNUP - Only stores pending user, NOT in database
+// ============================================================
 app.post('/api/auth/signup', async (req, res) => {
     try {
         const {
@@ -455,8 +464,19 @@ app.post('/api/auth/signup', async (req, res) => {
             });
         }
 
-        // Check if user exists
-        const existingUser = await db.users.findByEmail(email);
+        // Validate email format
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(email)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Please enter a valid email address'
+            });
+        }
+
+        const cleanEmail = email.trim().toLowerCase();
+
+        // Check if user already exists and is verified
+        const existingUser = await db.users.findByEmail(cleanEmail);
         if (existingUser) {
             return res.status(409).json({
                 success: false,
@@ -464,54 +484,51 @@ app.post('/api/auth/signup', async (req, res) => {
             });
         }
 
+        // Check if there's a pending user
+        const pendingUser = await db.pendingUsers.findByEmail(cleanEmail);
+        if (pendingUser) {
+            // Delete old pending user so they can retry
+            await db.pendingUsers.deleteByEmail(cleanEmail);
+        }
+
+        // Generate OTP
+        const otpCode = generateOTP();
+        const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+
         // Hash password
         const passwordHash = hashPassword(password);
 
-        // Create user
-        const user = await db.users.create({
+        // Store pending user data (temporary, NOT in database yet)
+        const userData = {
             firstName,
             middleName,
             lastName,
-            email,
+            email: cleanEmail,
             phone,
             dateOfBirth,
             gender,
             country,
-            passwordHash
-        });
-
-        console.log(`✅ User created: ${user.id}`);
-
-        // Generate OTP
-        const otpCode = generateOTP();
-        const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
-
-        // Save OTP
-        await db.otps.create({
-            email,
+            passwordHash,
             otpCode,
             expiresAt: expiresAt.toISOString()
-        });
+        };
+
+        await db.pendingUsers.create(userData);
 
         // Send OTP email
         const userName = `${firstName} ${lastName}`;
-        const emailResult = await sendOTPEmail(email, otpCode, userName);
+        const emailResult = await sendOTPEmail(cleanEmail, otpCode, userName);
 
-        // Generate JWT token
-        const token = generateToken(user);
-
-        // Return success
+        // Return success - user is pending verification
         res.status(201).json({
             success: true,
             message: emailResult.success 
-                ? 'User created successfully. Please verify your email with the OTP sent.'
-                : 'User created successfully. Please check your email for the OTP (if you don\'t see it, check spam).',
+                ? 'Please verify your email with the OTP sent.'
+                : 'Please check your email for the OTP (if you don\'t see it, check spam).',
             data: {
-                userId: user.id,
-                email: user.email,
-                name: `${user.first_name} ${user.last_name}`,
-                token: token,
-                isVerified: false,
+                email: cleanEmail,
+                name: userName,
+                requiresVerification: true,
                 otpCode: process.env.NODE_ENV === 'development' ? otpCode : undefined
             }
         });
@@ -526,7 +543,9 @@ app.post('/api/auth/signup', async (req, res) => {
     }
 });
 
-// VERIFY OTP
+// ============================================================
+// VERIFY OTP - ONLY HERE user gets saved to database
+// ============================================================
 app.post('/api/auth/verify-otp', async (req, res) => {
     try {
         const { email, otpCode } = req.body;
@@ -540,33 +559,60 @@ app.post('/api/auth/verify-otp', async (req, res) => {
             });
         }
 
-        const otpRecord = await db.otps.findValid(email, otpCode);
+        const cleanEmail = email.trim().toLowerCase();
 
-        if (!otpRecord) {
+        // Find pending user
+        const pendingRecord = await db.pendingUsers.findByEmail(cleanEmail);
+        if (!pendingRecord) {
             return res.status(400).json({
                 success: false,
-                message: 'Invalid or expired OTP code'
+                message: 'No pending signup found. Please sign up again.'
             });
         }
 
-        const user = await db.users.findByEmail(email);
-        if (!user) {
-            return res.status(404).json({
+        // Verify OTP
+        if (pendingRecord.otpCode !== otpCode) {
+            return res.status(400).json({
                 success: false,
-                message: 'User not found'
+                message: 'Invalid OTP code. Please try again.'
             });
         }
 
-        await db.otps.markUsed(otpRecord.id);
-        await db.users.verifyUser(user.id);
+        // Check if expired
+        if (new Date(pendingRecord.expiresAt) < new Date()) {
+            await db.pendingUsers.deleteByEmail(cleanEmail);
+            return res.status(400).json({
+                success: false,
+                message: 'OTP has expired. Please request a new one.'
+            });
+        }
 
+        // OTP is valid - NOW create the user in database
+        const userData = pendingRecord.userData;
+        
+        const user = await db.users.create({
+            firstName: userData.firstName,
+            middleName: userData.middleName,
+            lastName: userData.lastName,
+            email: userData.email,
+            phone: userData.phone,
+            dateOfBirth: userData.dateOfBirth,
+            gender: userData.gender,
+            country: userData.country,
+            passwordHash: userData.passwordHash
+        });
+
+        // Delete pending record
+        await db.pendingUsers.deleteByEmail(cleanEmail);
+
+        // Generate JWT token
         const token = generateToken(user);
 
-        console.log(`✅ User verified: ${email}`);
+        console.log(`✅ User verified and created: ${cleanEmail}`);
 
         res.json({
             success: true,
-            message: 'Email verified successfully!',
+            message: 'Email verified successfully! Account created.',
             data: {
                 userId: user.id,
                 email: user.email,
@@ -586,7 +632,9 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     }
 });
 
+// ============================================================
 // RESEND OTP
+// ============================================================
 app.post('/api/auth/resend-otp', async (req, res) => {
     try {
         const { email } = req.body;
@@ -600,32 +648,36 @@ app.post('/api/auth/resend-otp', async (req, res) => {
             });
         }
 
-        const user = await db.users.findByEmail(email);
-        if (!user) {
-            return res.status(404).json({
-                success: false,
-                message: 'User not found'
-            });
-        }
+        const cleanEmail = email.trim().toLowerCase();
 
-        if (user.is_verified) {
+        // Find pending user
+        const pendingRecord = await db.pendingUsers.findByEmail(cleanEmail);
+        if (!pendingRecord) {
             return res.status(400).json({
                 success: false,
-                message: 'User is already verified'
+                message: 'No pending signup found. Please sign up again.'
             });
         }
 
-        const otpCode = generateOTP();
+        // Generate new OTP
+        const newOtpCode = generateOTP();
         const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
 
-        await db.otps.create({
-            email,
-            otpCode,
+        // Update pending record
+        pendingRecord.otpCode = newOtpCode;
+        pendingRecord.expiresAt = expiresAt.toISOString();
+
+        // Re-save (delete and create new)
+        await db.pendingUsers.deleteByEmail(cleanEmail);
+        await db.pendingUsers.create({
+            ...pendingRecord.userData,
+            otpCode: newOtpCode,
             expiresAt: expiresAt.toISOString()
         });
 
-        const userName = `${user.first_name} ${user.last_name}`;
-        await sendOTPEmail(email, otpCode, userName);
+        // Send new OTP email
+        const userName = `${pendingRecord.userData.firstName} ${pendingRecord.userData.lastName}`;
+        await sendOTPEmail(cleanEmail, newOtpCode, userName);
 
         res.json({
             success: true,
@@ -642,7 +694,9 @@ app.post('/api/auth/resend-otp', async (req, res) => {
     }
 });
 
+// ============================================================
 // LOGIN
+// ============================================================
 app.post('/api/auth/login', async (req, res) => {
     try {
         const { email, password } = req.body;
@@ -656,7 +710,10 @@ app.post('/api/auth/login', async (req, res) => {
             });
         }
 
-        const user = await db.users.findByEmail(email);
+        const cleanEmail = email.trim().toLowerCase();
+
+        // Check if user exists in database (only verified users are here)
+        const user = await db.users.findByEmail(cleanEmail);
         if (!user) {
             return res.status(401).json({
                 success: false,
@@ -664,6 +721,7 @@ app.post('/api/auth/login', async (req, res) => {
             });
         }
 
+        // Check password
         const isValid = comparePassword(password, user.password_hash);
         if (!isValid) {
             return res.status(401).json({
@@ -672,36 +730,15 @@ app.post('/api/auth/login', async (req, res) => {
             });
         }
 
-        if (!user.is_verified) {
-            console.log(`⚠️ User not verified: ${email}`);
-
-            const otpCode = generateOTP();
-            const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
-
-            await db.otps.create({
-                email,
-                otpCode,
-                expiresAt: expiresAt.toISOString()
-            });
-
-            const userName = `${user.first_name} ${user.last_name}`;
-            await sendOTPEmail(email, otpCode, userName);
-
-            return res.status(403).json({
-                success: false,
-                message: 'Email not verified. A new OTP has been sent to your email.',
-                requiresVerification: true,
-                email: email
-            });
-        }
-
+        // Generate token
         const token = generateToken(user);
 
+        // Update last login
         await db.users.update(user.id, {
             last_login_at: new Date().toISOString()
         });
 
-        console.log(`✅ Login successful: ${email}`);
+        console.log(`✅ Login successful: ${cleanEmail}`);
 
         res.json({
             success: true,
@@ -725,7 +762,9 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
+// ============================================================
 // VERIFY TOKEN
+// ============================================================
 app.post('/api/auth/verify-token', async (req, res) => {
     try {
         const { token } = req.body;
@@ -774,7 +813,9 @@ app.post('/api/auth/verify-token', async (req, res) => {
     }
 });
 
+// ============================================================
 // GET USER
+// ============================================================
 app.get('/api/user/me', authenticateToken, async (req, res) => {
     try {
         const user = await db.users.findById(req.user.userId);
@@ -808,105 +849,6 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
         res.status(500).json({
             success: false,
             message: 'Failed to fetch user data',
-            error: process.env.NODE_ENV === 'development' ? error.message : undefined
-        });
-    }
-});
-
-// UPDATE PROFILE
-app.put('/api/user/profile', authenticateToken, async (req, res) => {
-    try {
-        const { firstName, middleName, lastName, phone, dateOfBirth, gender, country } = req.body;
-
-        const updates = {};
-        if (firstName) updates.first_name = firstName;
-        if (middleName !== undefined) updates.middle_name = middleName;
-        if (lastName) updates.last_name = lastName;
-        if (phone) updates.phone = phone;
-        if (dateOfBirth) updates.date_of_birth = dateOfBirth;
-        if (gender) updates.gender = gender;
-        if (country) updates.country = country;
-
-        const user = await db.users.update(req.user.userId, updates);
-
-        res.json({
-            success: true,
-            message: 'Profile updated successfully',
-            data: {
-                id: user.id,
-                email: user.email,
-                firstName: user.first_name,
-                middleName: user.middle_name,
-                lastName: user.last_name,
-                phone: user.phone,
-                dateOfBirth: user.date_of_birth,
-                gender: user.gender,
-                country: user.country,
-                isVerified: user.is_verified
-            }
-        });
-
-    } catch (error) {
-        console.error('❌ Update profile error:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Failed to update profile',
-            error: process.env.NODE_ENV === 'development' ? error.message : undefined
-        });
-    }
-});
-
-// CHANGE PASSWORD
-app.post('/api/user/change-password', authenticateToken, async (req, res) => {
-    try {
-        const { currentPassword, newPassword } = req.body;
-
-        if (!currentPassword || !newPassword) {
-            return res.status(400).json({
-                success: false,
-                message: 'Current password and new password are required'
-            });
-        }
-
-        if (newPassword.length < 8) {
-            return res.status(400).json({
-                success: false,
-                message: 'New password must be at least 8 characters'
-            });
-        }
-
-        const user = await db.users.findById(req.user.userId);
-        if (!user) {
-            return res.status(404).json({
-                success: false,
-                message: 'User not found'
-            });
-        }
-
-        const isValid = comparePassword(currentPassword, user.password_hash);
-        if (!isValid) {
-            return res.status(401).json({
-                success: false,
-                message: 'Current password is incorrect'
-            });
-        }
-
-        const newPasswordHash = hashPassword(newPassword);
-
-        await db.users.update(user.id, {
-            password_hash: newPasswordHash
-        });
-
-        res.json({
-            success: true,
-            message: 'Password changed successfully'
-        });
-
-    } catch (error) {
-        console.error('❌ Change password error:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Failed to change password',
             error: process.env.NODE_ENV === 'development' ? error.message : undefined
         });
     }

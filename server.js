@@ -1,6 +1,6 @@
 // ============================================================
 // server.js - AAGS Backend Server
-// Includes: Auth, JWT, Supabase, Brevo, Live News RSS
+// Includes: Auth, JWT, Supabase, Brevo, Live News RSS with images
 // ============================================================
 
 const express = require('express');
@@ -58,7 +58,7 @@ const apiInstance = new SibApiV3Sdk.TransactionalEmailsApi();
 // RSS Parser
 const rssParser = new Parser({
     timeout: 10000,
-    headers: { 'User-Agent': 'AAGS-Bot/1.0' }
+    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; AAGS-Bot/1.0)' }
 });
 
 // ============================================================
@@ -200,43 +200,113 @@ const NEWS_FEEDS = [
         source: 'Google News'
     },
     {
-        url: 'https://www.agriculture.com/rss/news',
-        source: 'Agriculture.com'
+        url: 'https://news.google.com/rss/search?q=farm+grants+agriculture+funding&hl=en-US&gl=US&ceid=US:en',
+        source: 'Google News'
+    },
+    {
+        url: 'https://news.google.com/rss/search?q=rural+development+grants+USDA&hl=en-US&gl=US&ceid=US:en',
+        source: 'Google News'
+    },
+    {
+        url: 'https://news.google.com/rss/search?q=sustainable+agriculture+funding&hl=en-US&gl=US&ceid=US:en',
+        source: 'Google News'
     }
 ];
 
 // In-memory news cache (refreshed every 30 min)
 let newsCache = { articles: [], fetchedAt: null };
 
+// ============================================================
+// CATEGORY DETECTION & FALLBACK IMAGES
+// ============================================================
+function detectCategory(title) {
+    const t = (title || '').toLowerCase();
+    if (t.includes('grant') || t.includes('funding') || t.includes('loan')) return 'grant';
+    if (t.includes('sustain') || t.includes('environment') || t.includes('climate')) return 'sustainable';
+    if (t.includes('rural') || t.includes('community')) return 'rural';
+    if (t.includes('equipment') || t.includes('infrastructure') || t.includes('technology') || t.includes('tractor')) return 'equipment';
+    if (t.includes('livestock') || t.includes('cattle') || t.includes('dairy') || t.includes('poultry')) return 'livestock';
+    if (t.includes('crop') || t.includes('corn') || t.includes('wheat') || t.includes('soybean') || t.includes('harvest')) return 'crops';
+    return 'general';
+}
+
+function getCategoryImage(category) {
+    const images = {
+        grant: 'https://images.unsplash.com/photo-1500595046743-cd271d694d30?w=600&h=400&fit=crop',
+        sustainable: 'https://images.unsplash.com/photo-1592982537447-7440770cbfc9?w=600&h=400&fit=crop',
+        rural: 'https://images.unsplash.com/photo-1500382017468-9049fed747ef?w=600&h=400&fit=crop',
+        equipment: 'https://images.unsplash.com/photo-1625246333195-78d9c38ad449?w=600&h=400&fit=crop',
+        livestock: 'https://images.unsplash.com/photo-1570042225831-d98fa7577f1e?w=600&h=400&fit=crop',
+        crops: 'https://images.unsplash.com/photo-1560493676-04071c5f467b?w=600&h=400&fit=crop',
+        general: 'https://images.unsplash.com/photo-1560493676-04071c5f467b?w=600&h=400&fit=crop'
+    };
+    return images[category] || images.general;
+}
+
+// ============================================================
+// FETCH & PARSE FEED WITH IMAGE EXTRACTION
+// ============================================================
 async function fetchAndParseFeed(feed) {
     try {
         const parsed = await rssParser.parseURL(feed.url);
         return (parsed.items || []).slice(0, 8).map(item => {
-            // Extract image from RSS enclosure or content
             let image = null;
+
+            // 1. Standard enclosure
             if (item.enclosure?.url) image = item.enclosure.url;
-            else if (item['media:content']?.$?.url) image = item['media:content'].$.url;
-            else {
-                const m = (item.content || item['content:encoded'] || '').match(/<img[^>]+src="([^"]+)"/i);
-                if (m) image = m[1];
+
+            // 2. media:content / media:thumbnail (RSS extensions)
+            if (!image && item['media:content']) {
+                const mc = item['media:content'];
+                image = mc?.$?.url || (Array.isArray(mc) ? mc[0]?.$?.url : null);
             }
-            // Google News RSS images
-            if (!image && item.contentSnippet) {
-                const m = item.contentSnippet.match(/https?:\/\/[^\s]+\.(jpg|jpeg|png|webp)/i);
-                if (m) image = m[0];
+            if (!image && item['media:thumbnail']) {
+                const mt = item['media:thumbnail'];
+                image = mt?.$?.url || (Array.isArray(mt) ? mt[0]?.$?.url : null);
+            }
+
+            // 3. Extract from content HTML — try multiple sources
+            const htmlSources = [
+                item.content,
+                item['content:encoded'],
+                item.description,
+                item.summary
+            ].filter(Boolean);
+
+            for (const html of htmlSources) {
+                if (image) break;
+                // Try <img src="...">
+                let m = html.match(/<img[^>]+src=["']([^"']+)["']/i);
+                if (m && m[1] && !m[1].includes('data:image')) {
+                    image = m[1];
+                    break;
+                }
+                // Try srcset
+                m = html.match(/srcset=["']([^"'\s]+)/i);
+                if (m && m[1]) {
+                    image = m[1];
+                    break;
+                }
+            }
+
+            // 4. Fallback: category-based image (ensures every card has a picture)
+            if (!image) {
+                const category = detectCategory(item.title || '');
+                image = getCategoryImage(category);
             }
 
             return {
                 title: item.title || '',
-                description: (item.contentSnippet || item.content || '').replace(/<[^>]+>/g, '').slice(0, 220),
+                description: (item.contentSnippet || item.content || item.description || '')
+                    .replace(/<[^>]+>/g, '').slice(0, 220),
                 url: item.link || '',
-                image: image || null,
+                image: image,
                 source: feed.source,
                 publishedAt: item.pubDate || item.isoDate || new Date().toISOString()
             };
         });
     } catch (err) {
-        console.error(`❌ Feed failed (${feed.source}):`, err.message);
+        console.warn(`[News] Skipped ${feed.source}: ${err.message}`);
         return [];
     }
 }
@@ -249,7 +319,7 @@ async function refreshNews() {
     // Dedupe by title
     const seen = new Set();
     const unique = all.filter(a => {
-        const key = a.title.toLowerCase().trim();
+        const key = (a.title || '').toLowerCase().trim();
         if (seen.has(key) || !key) return false;
         seen.add(key);
         return true;
@@ -291,7 +361,6 @@ app.get('/api/health', (req, res) => {
 // ===== LIVE NEWS ENDPOINT =====
 app.get('/api/news', async (req, res) => {
     try {
-        // Refresh if cache older than 30 min or empty
         const stale = !newsCache.fetchedAt ||
             (Date.now() - new Date(newsCache.fetchedAt).getTime()) > 30 * 60 * 1000;
 
@@ -512,7 +581,7 @@ app.use((req, res) => res.status(404).json({ success: false, message: 'Route not
 app.listen(PORT, () => {
     console.log('========================================');
     console.log(`🚀 AAGS Backend on port ${PORT}`);
-    console.log(`📰 News: RSS-based (Google News + Agriculture.com)`);
+    console.log(`📰 News: RSS-based (Google News + fallback images)`);
     console.log(`🗄️  Supabase: ${process.env.SUPABASE_URL ? '✅' : '❌'}`);
     console.log(`📧 Brevo: ${BREVO_API_KEY ? '✅' : '❌'}`);
     console.log('========================================');

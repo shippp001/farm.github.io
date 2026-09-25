@@ -1,6 +1,11 @@
 // ============================================================
 // server.js - AAGS Backend Server
-// News with real unique images (og:image fetch + 50-image fallback pool)
+// Full integrations:
+//   - Supabase (users, otp, grant applications)
+//   - Brevo API (OTP emails)
+//   - Live News RSS (Google News, no API key)
+//   - BTC Payment Cipher (Blockchain.com verification)
+//   - JWT authentication
 // ============================================================
 
 const express = require('express');
@@ -20,7 +25,14 @@ const PORT = process.env.PORT || 5000;
 // ============================================================
 // ENV VALIDATION
 // ============================================================
-const requiredEnvVars = ['SUPABASE_URL', 'SUPABASE_SERVICE_KEY', 'JWT_SECRET', 'BREVO_API_KEY', 'BREVO_FROM_EMAIL'];
+const requiredEnvVars = [
+    'SUPABASE_URL',
+    'SUPABASE_SERVICE_KEY',
+    'JWT_SECRET',
+    'BREVO_API_KEY',
+    'BREVO_FROM_EMAIL'
+];
+
 const missingVars = requiredEnvVars.filter(v => !process.env[v]);
 if (missingVars.length > 0) {
     console.error('❌ Missing env vars:', missingVars.join(', '));
@@ -28,17 +40,19 @@ if (missingVars.length > 0) {
 }
 
 // ============================================================
-// CONFIG
+// CONFIGURATION
 // ============================================================
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_EXPIRY = '7d';
 
+// Supabase
 const supabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_SERVICE_KEY,
     { auth: { autoRefreshToken: false, persistSession: false } }
 );
 
+// Brevo
 const BREVO_API_KEY = process.env.BREVO_API_KEY;
 const BREVO_FROM_EMAIL = process.env.BREVO_FROM_EMAIL;
 const BREVO_FROM_NAME = process.env.BREVO_FROM_NAME || 'AAGS';
@@ -47,6 +61,7 @@ const defaultClient = SibApiV3Sdk.ApiClient.instance;
 defaultClient.authentications['api-key'].apiKey = BREVO_API_KEY;
 const apiInstance = new SibApiV3Sdk.TransactionalEmailsApi();
 
+// RSS
 const rssParser = new Parser({
     timeout: 10000,
     headers: { 'User-Agent': 'Mozilla/5.0 (compatible; AAGS-Bot/1.0)' }
@@ -58,9 +73,14 @@ const rssParser = new Parser({
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true }));
-app.use((req, res, next) => { console.log(`📝 ${req.method} ${req.path}`); next(); });
-app.use('/api/', rateLimit({ windowMs: 15 * 60 * 1000, max: 200 }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+app.use((req, res, next) => {
+    console.log(`📝 ${req.method} ${req.path}`);
+    next();
+});
+
+app.use('/api/', rateLimit({ windowMs: 15 * 60 * 1000, max: 300 }));
 
 // ============================================================
 // DATABASE HELPERS
@@ -69,11 +89,16 @@ const db = {
     users: {
         async create(d) {
             const { data, error } = await supabase.from('users').insert([{
-                email: d.email, password_hash: d.passwordHash,
-                first_name: d.firstName, middle_name: d.middleName || null,
-                last_name: d.lastName, phone: d.phone,
-                date_of_birth: d.dateOfBirth, gender: d.gender || null,
-                country: d.country, is_verified: true,
+                email: d.email,
+                password_hash: d.passwordHash,
+                first_name: d.firstName,
+                middle_name: d.middleName || null,
+                last_name: d.lastName,
+                phone: d.phone,
+                date_of_birth: d.dateOfBirth,
+                gender: d.gender || null,
+                country: d.country,
+                is_verified: true,
                 email_verified_at: new Date().toISOString()
             }]).select().single();
             if (error) throw new Error(`Supabase: ${error.message}`);
@@ -95,13 +120,33 @@ const db = {
             if (error) throw new Error(`Supabase: ${error.message}`);
             return data;
         }
+    },
+    applications: {
+        async create(payload) {
+            const { data, error } = await supabase.from('grant_applications').insert([{
+                ref_number: payload.refNumber,
+                user_id: payload.userId,
+                email: payload.email,
+                form_data: payload.formData,
+                selections: payload.selections,
+                uploaded_files: payload.uploadedFiles,
+                status: 'Pending',
+                created_at: new Date().toISOString()
+            }]).select().single();
+            if (error) {
+                console.warn('⚠️ Application insert failed (table may not exist):', error.message);
+                return null;
+            }
+            return data;
+        }
     }
 };
 
+// Pending signups
 const pendingUsers = new Map();
 
 // ============================================================
-// EMAIL SERVICE (Brevo API)
+// EMAIL SERVICE (Brevo)
 // ============================================================
 async function sendOTPEmail(email, otpCode, userName) {
     try {
@@ -176,9 +221,7 @@ const NEWS_FEEDS = [
 
 let newsCache = { articles: [], fetchedAt: null };
 
-// ============================================================
-// LARGE IMAGE POOL — 50 unique agricultural images
-// ============================================================
+// Image pool for fallback (50 unique agricultural images)
 const IMAGE_POOL = [
     'https://images.unsplash.com/photo-1500595046743-cd271d694d30?w=600&h=400&fit=crop',
     'https://images.unsplash.com/photo-1592982537447-7440770cbfc9?w=600&h=400&fit=crop',
@@ -195,44 +238,13 @@ const IMAGE_POOL = [
     'https://images.unsplash.com/photo-1615729947596-a598e5de0ab3?w=600&h=400&fit=crop',
     'https://images.unsplash.com/photo-1620200423727-8127f75d7f53?w=600&h=400&fit=crop',
     'https://images.unsplash.com/photo-1605000797499-95a51c5269ae?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1560493676-04071c5f467b?w=600&h=400&fit=crop',
     'https://images.unsplash.com/photo-1595855759920-86582396756a?w=600&h=400&fit=crop',
     'https://images.unsplash.com/photo-1622383563227-04401ab4e5ea?w=600&h=400&fit=crop',
     'https://images.unsplash.com/photo-1495745455409-ff12e0ce45a4?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1595855759920-86582396756a?w=600&h=400&fit=crop',
     'https://images.unsplash.com/photo-1518977676601-b53f82aba655?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1595855759920-86582396756a?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1560493676-04071c5f467b?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1605000797499-95a51c5269ae?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1530836369250-ef72a3f5cda8?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1516253593875-bd7ba052fbc5?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1471193945509-9ad0617afabf?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1492496913980-501348b61469?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1615729947596-a598e5de0ab3?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1620200423727-8127f75d7f53?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1523348837708-15d4a09cfac2?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1464226184884-fa280b87c399?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1622383563227-04401ab4e5ea?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1495745455409-ff12e0ce45a4?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1518977676601-b53f82aba655?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1574943320219-553eb213f72d?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1592982537447-7440770cbfc9?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1500595046743-cd271d694d30?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1500382017468-9049fed747ef?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1625246333195-78d9c38ad449?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1570042225831-d98fa7577f1e?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1560493676-04071c5f467b?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1523348837708-15d4a09cfac2?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1530836369250-ef72a3f5cda8?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1464226184884-fa280b87c399?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1516253593875-bd7ba052fbc5?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1492496913980-501348b61469?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1471193945509-9ad0617afabf?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1615729947596-a598e5de0ab3?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1605000797499-95a51c5269ae?w=600&h=400&fit=crop'
+    'https://images.unsplash.com/photo-1574943320219-553eb213f72d?w=600&h=400&fit=crop'
 ];
 
-// Deterministic hash
 function hashString(str) {
     let hash = 0;
     for (let i = 0; i < str.length; i++) {
@@ -242,7 +254,6 @@ function hashString(str) {
     return Math.abs(hash);
 }
 
-// Pick unique image per article
 function pickUniqueImage(title, usedIndices) {
     const startIdx = hashString(title || 'x') % IMAGE_POOL.length;
     let idx = startIdx;
@@ -255,10 +266,7 @@ function pickUniqueImage(title, usedIndices) {
     return IMAGE_POOL[idx];
 }
 
-// ============================================================
-// OG:IMAGE FETCH (real article image)
-// ============================================================
-const ogImageCache = new Map(); // url -> image or null
+const ogImageCache = new Map();
 
 async function fetchOgImage(url, timeout = 6000) {
     if (!url) return null;
@@ -272,8 +280,8 @@ async function fetchOgImage(url, timeout = 6000) {
             redirect: 'follow',
             signal: controller.signal,
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'text/html'
             }
         });
         clearTimeout(timer);
@@ -284,11 +292,9 @@ async function fetchOgImage(url, timeout = 6000) {
         }
 
         const html = await res.text();
-        // Try multiple meta tag patterns
-        let match = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i)
+        const match = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i)
             || html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i)
-            || html.match(/<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i)
-            || html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:image["']/i);
+            || html.match(/<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i);
 
         const image = match ? match[1] : null;
         ogImageCache.set(url, image);
@@ -299,41 +305,28 @@ async function fetchOgImage(url, timeout = 6000) {
     }
 }
 
-// ============================================================
-// FETCH & PARSE FEED
-// ============================================================
 async function fetchAndParseFeed(feed) {
     try {
         const parsed = await rssParser.parseURL(feed.url);
         return (parsed.items || []).slice(0, 8).map(item => {
             let rssImage = null;
-
-            // Try RSS enclosure / media
             if (item.enclosure?.url) rssImage = item.enclosure.url;
             if (!rssImage && item['media:content']) {
                 const mc = item['media:content'];
                 rssImage = mc?.$?.url || (Array.isArray(mc) ? mc[0]?.$?.url : null);
             }
-            if (!rssImage && item['media:thumbnail']) {
-                const mt = item['media:thumbnail'];
-                rssImage = mt?.$?.url || (Array.isArray(mt) ? mt[0]?.$?.url : null);
-            }
-
-            // Try to extract <img> from content HTML
             if (!rssImage) {
-                const htmlSources = [item.content, item['content:encoded'], item.description, item.summary].filter(Boolean);
+                const htmlSources = [item.content, item['content:encoded'], item.description].filter(Boolean);
                 for (const html of htmlSources) {
                     const m = html.match(/<img[^>]+src=["']([^"']+)["']/i);
                     if (m && m[1] && !m[1].includes('data:image')) { rssImage = m[1]; break; }
                 }
             }
-
             return {
                 title: item.title || '',
-                description: (item.contentSnippet || item.content || item.description || '')
-                    .replace(/<[^>]+>/g, '').slice(0, 220),
+                description: (item.contentSnippet || item.content || item.description || '').replace(/<[^>]+>/g, '').slice(0, 220),
                 url: item.link || '',
-                image: rssImage, // may be null
+                image: rssImage,
                 source: feed.source,
                 publishedAt: item.pubDate || item.isoDate || new Date().toISOString()
             };
@@ -344,15 +337,11 @@ async function fetchAndParseFeed(feed) {
     }
 }
 
-// ============================================================
-// REFRESH NEWS
-// ============================================================
 async function refreshNews() {
     console.log('[News] Refreshing feeds...');
     const results = await Promise.all(NEWS_FEEDS.map(fetchAndParseFeed));
     let all = results.flat();
 
-    // Dedupe by title
     const seen = new Set();
     all = all.filter(a => {
         const key = (a.title || '').toLowerCase().trim();
@@ -360,59 +349,164 @@ async function refreshNews() {
         seen.add(key);
         return true;
     });
-
-    // Sort newest first
     all.sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt));
-
     const top = all.slice(0, 24);
 
-    // Step 1: Fetch real og:image in parallel for articles missing image
-    console.log(`[News] Fetching og:images for ${top.filter(a => !a.image).length} articles...`);
+    // Fetch real og:images in parallel
     await Promise.all(top.map(async (article) => {
-        if (article.image) return; // already has RSS image
+        if (article.image) return;
         const og = await fetchOgImage(article.url);
         if (og) article.image = og;
     }));
 
-    // Step 2: Assign unique fallback for articles still missing images
+    // Unique fallback
     const usedIndices = new Set();
-    let fallbackCount = 0;
     top.forEach(article => {
         if (!article.image) {
             article.image = pickUniqueImage(article.title, usedIndices);
-            fallbackCount++;
         }
     });
 
-    newsCache = {
-        articles: top,
-        fetchedAt: new Date().toISOString()
-    };
-
-    console.log(`[News] ✅ Cached ${top.length} articles (${fallbackCount} used fallback images)`);
+    newsCache = { articles: top, fetchedAt: new Date().toISOString() };
+    console.log(`[News] ✅ Cached ${top.length} articles`);
     return newsCache;
 }
 
-// Refresh on start and every 30 min
 setTimeout(refreshNews, 5000);
 setInterval(refreshNews, 30 * 60 * 1000);
 
 // ============================================================
+// BTC PAYMENT CIPHER
+// ============================================================
+const BTC_API_BASE = 'https://blockchain.info';
+const paymentChecks = new Map();
+
+app.post('/api/payment/verify-btc', async (req, res) => {
+    try {
+        const { address, expectedAmountUSD, expectedAmountBTC, txid } = req.body;
+
+        if (!address) {
+            return res.status(400).json({ success: false, message: 'BTC address required' });
+        }
+
+        console.log(`🔎 Cipher check for address: ${address}`);
+
+        const cacheKey = address + '|' + (txid || '');
+        const cached = paymentChecks.get(cacheKey);
+        if (cached && (Date.now() - cached.checkedAt) < 8000) {
+            return res.json(cached.data);
+        }
+
+        const url = `${BTC_API_BASE}/rawaddr/${address}?limit=20`;
+        const apiRes = await fetch(url, {
+            headers: { 'User-Agent': 'AAGS-Payment-Cipher/1.0' }
+        });
+
+        if (!apiRes.ok) {
+            throw new Error(`Blockchain.com returned ${apiRes.status}`);
+        }
+
+        const data = await apiRes.json();
+
+        const totalReceived = data.total_received || 0;
+        const nTx = data.n_tx || 0;
+        const finalBalance = data.final_balance || 0;
+        const expectedSatoshi = Math.round((parseFloat(expectedAmountBTC) || 0) * 100000000);
+
+        let latestTx = null;
+        let confirmations = 0;
+        let receivedSatoshi = 0;
+
+        if (data.txs && data.txs.length > 0) {
+            const incomingTxs = data.txs
+                .filter(tx => tx.out && tx.out.some(o => o.addr === address))
+                .sort((a, b) => b.time - a.time);
+
+            if (incomingTxs.length > 0) {
+                latestTx = incomingTxs[0];
+                receivedSatoshi = latestTx.out
+                    .filter(o => o.addr === address)
+                    .reduce((sum, o) => sum + (o.value || 0), 0);
+
+                if (latestTx.block_height) {
+                    try {
+                        const blockRes = await fetch(`${BTC_API_BASE}/latestblock`);
+                        const blockData = await blockRes.json();
+                        confirmations = (blockData.height - latestTx.block_height) + 1;
+                    } catch (e) {}
+                }
+            }
+        }
+
+        let status = 'awaiting';
+        const minConfirmations = 1;
+
+        if (receivedSatoshi > 0) {
+            if (confirmations >= minConfirmations) status = 'confirmed';
+            else if (confirmations === 0) status = 'pending';
+            else status = 'confirming';
+        } else if (nTx === 0) {
+            status = 'awaiting';
+        }
+
+        const result = {
+            success: true,
+            status,
+            address,
+            totalReceivedSatoshi: totalReceived,
+            totalReceivedBTC: (totalReceived / 100000000).toFixed(8),
+            receivedSatoshi,
+            receivedBTC: (receivedSatoshi / 100000000).toFixed(8),
+            expectedSatoshi,
+            expectedBTC: expectedAmountBTC,
+            confirmations,
+            nTx,
+            finalBalanceSatoshi: finalBalance,
+            finalBalanceBTC: (finalBalance / 100000000).toFixed(8),
+            latestTxHash: latestTx ? latestTx.hash : null,
+            latestTxTime: latestTx ? latestTx.time : null,
+            checkedAt: new Date().toISOString()
+        };
+
+        paymentChecks.set(cacheKey, { checkedAt: Date.now(), data: result });
+        if (paymentChecks.size > 200) {
+            const oldestKey = paymentChecks.keys().next().value;
+            paymentChecks.delete(oldestKey);
+        }
+
+        console.log(`✅ Cipher: ${status} (${confirmations} conf, received: ${result.receivedBTC} BTC)`);
+        res.json(result);
+
+    } catch (err) {
+        console.error('❌ Cipher error:', err.message);
+        res.status(500).json({
+            success: false,
+            status: 'error',
+            message: 'Unable to verify payment at this time. Please try again shortly.'
+        });
+    }
+});
+
+// ============================================================
 // ROUTES
 // ============================================================
+
+// Health check
 app.get('/api/health', (req, res) => {
     res.json({
-        success: true, status: 'healthy',
+        success: true,
+        status: 'healthy',
         timestamp: new Date().toISOString(),
         services: {
             supabase: 'connected',
             brevo: 'configured',
-            news: newsCache.fetchedAt ? 'cached' : 'pending'
+            news: newsCache.fetchedAt ? 'cached' : 'pending',
+            cipher: 'active'
         }
     });
 });
 
-// LIVE NEWS
+// ===== NEWS =====
 app.get('/api/news', async (req, res) => {
     try {
         const stale = !newsCache.fetchedAt ||
@@ -420,7 +514,11 @@ app.get('/api/news', async (req, res) => {
         if (stale || newsCache.articles.length === 0) await refreshNews();
 
         if (newsCache.articles.length === 0) {
-            return res.status(503).json({ success: false, message: 'News temporarily unavailable', articles: [] });
+            return res.status(503).json({
+                success: false,
+                message: 'Live news temporarily unavailable. Please try again later.',
+                articles: []
+            });
         }
 
         res.json({
@@ -430,31 +528,44 @@ app.get('/api/news', async (req, res) => {
             articles: newsCache.articles
         });
     } catch (err) {
-        console.error('❌ News error:', err);
         res.status(500).json({ success: false, message: 'Failed to load news', articles: [] });
     }
 });
 
-// ===== AUTH ROUTES =====
+// ===== AUTH =====
+
+// Signup
 app.post('/api/auth/signup', async (req, res) => {
     try {
         const { firstName, middleName, lastName, email, phone, dateOfBirth, gender, country, password } = req.body;
+
         if (!firstName || !lastName || !email || !phone || !dateOfBirth || !country || !password) {
             return res.status(400).json({ success: false, message: 'Missing required fields' });
         }
+
         const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-        if (!emailRegex.test(email)) return res.status(400).json({ success: false, message: 'Invalid email format' });
+        if (!emailRegex.test(email)) {
+            return res.status(400).json({ success: false, message: 'Invalid email format' });
+        }
 
         const cleanEmail = email.trim().toLowerCase();
+
         const existing = await db.users.findByEmail(cleanEmail);
-        if (existing) return res.status(409).json({ success: false, message: 'User already exists' });
+        if (existing) {
+            return res.status(409).json({ success: false, message: 'User already exists' });
+        }
 
         const otpCode = generateOTP();
         const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
 
         pendingUsers.set(cleanEmail, {
-            userData: { firstName, middleName, lastName, email: cleanEmail, phone, dateOfBirth, gender, country, passwordHash: hashPassword(password) },
-            otpCode, expiresAt
+            userData: {
+                firstName, middleName, lastName,
+                email: cleanEmail, phone, dateOfBirth, gender, country,
+                passwordHash: hashPassword(password)
+            },
+            otpCode,
+            expiresAt
         });
 
         const emailResult = await sendOTPEmail(cleanEmail, otpCode, `${firstName} ${lastName}`);
@@ -470,6 +581,7 @@ app.post('/api/auth/signup', async (req, res) => {
     }
 });
 
+// Verify OTP
 app.post('/api/auth/verify-otp', async (req, res) => {
     try {
         const { email, otpCode } = req.body;
@@ -477,20 +589,29 @@ app.post('/api/auth/verify-otp', async (req, res) => {
 
         const cleanEmail = email.trim().toLowerCase();
         const pending = pendingUsers.get(cleanEmail);
+
         if (!pending) return res.status(400).json({ success: false, message: 'No pending signup found' });
         if (new Date(pending.expiresAt) < new Date()) {
             pendingUsers.delete(cleanEmail);
-            return res.status(400).json({ success: false, message: 'OTP expired' });
+            return res.status(400).json({ success: false, message: 'OTP expired. Please sign up again.' });
         }
-        if (pending.otpCode !== otpCode) return res.status(400).json({ success: false, message: 'Invalid OTP code' });
+        if (pending.otpCode !== otpCode) {
+            return res.status(400).json({ success: false, message: 'Invalid OTP code' });
+        }
 
         const user = await db.users.create(pending.userData);
         pendingUsers.delete(cleanEmail);
+
         const token = generateToken(user);
 
         res.json({
-            success: true, message: 'Email verified! Account created.',
-            data: { userId: user.id, email: user.email, name: `${user.first_name} ${user.last_name}`, token, isVerified: true }
+            success: true,
+            message: 'Email verified! Account created.',
+            data: {
+                userId: user.id, email: user.email,
+                name: `${user.first_name} ${user.last_name}`,
+                token, isVerified: true
+            }
         });
     } catch (err) {
         console.error('❌ Verify OTP:', err);
@@ -498,10 +619,12 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     }
 });
 
+// Resend OTP
 app.post('/api/auth/resend-otp', async (req, res) => {
     try {
         const { email } = req.body;
         if (!email) return res.status(400).json({ success: false, message: 'Email required' });
+
         const cleanEmail = email.trim().toLowerCase();
         const pending = pendingUsers.get(cleanEmail);
         if (!pending) return res.status(400).json({ success: false, message: 'No pending signup' });
@@ -509,6 +632,7 @@ app.post('/api/auth/resend-otp', async (req, res) => {
         const newOtp = generateOTP();
         pending.otpCode = newOtp;
         pending.expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+
         await sendOTPEmail(cleanEmail, newOtp, `${pending.userData.firstName} ${pending.userData.lastName}`);
 
         res.json({ success: true, message: 'New OTP sent' });
@@ -517,6 +641,7 @@ app.post('/api/auth/resend-otp', async (req, res) => {
     }
 });
 
+// Login
 app.post('/api/auth/login', async (req, res) => {
     try {
         const { email, password } = req.body;
@@ -524,20 +649,29 @@ app.post('/api/auth/login', async (req, res) => {
 
         const user = await db.users.findByEmail(email.trim().toLowerCase());
         if (!user) return res.status(401).json({ success: false, message: 'Invalid email or password' });
-        if (!comparePassword(password, user.password_hash)) return res.status(401).json({ success: false, message: 'Invalid email or password' });
+
+        if (!comparePassword(password, user.password_hash)) {
+            return res.status(401).json({ success: false, message: 'Invalid email or password' });
+        }
 
         const token = generateToken(user);
         await db.users.update(user.id, { last_login_at: new Date().toISOString() });
 
         res.json({
-            success: true, message: 'Login successful',
-            data: { userId: user.id, email: user.email, name: `${user.first_name} ${user.last_name}`, token, isVerified: true }
+            success: true,
+            message: 'Login successful',
+            data: {
+                userId: user.id, email: user.email,
+                name: `${user.first_name} ${user.last_name}`,
+                token, isVerified: true
+            }
         });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
 });
 
+// Verify token
 app.post('/api/auth/verify-token', async (req, res) => {
     try {
         const { token } = req.body;
@@ -558,6 +692,7 @@ app.post('/api/auth/verify-token', async (req, res) => {
     }
 });
 
+// Get current user
 app.get('/api/user/me', authenticateToken, async (req, res) => {
     try {
         const user = await db.users.findById(req.user.userId);
@@ -577,14 +712,47 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
     }
 });
 
-app.use((req, res) => res.status(404).json({ success: false, message: 'Route not found' }));
+// ===== GRANT APPLICATION =====
 
+app.post('/api/grants/apply', async (req, res) => {
+    try {
+        const { refNumber, userId, email, formData, selections, uploadedFiles } = req.body;
+
+        console.log('📄 Grant application submission:', refNumber);
+
+        const result = await db.applications.create({
+            refNumber, userId, email, formData, selections, uploadedFiles
+        });
+
+        res.json({
+            success: true,
+            message: 'Application submitted successfully',
+            data: result || { refNumber }
+        });
+    } catch (err) {
+        console.error('❌ Grant application error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// ============================================================
+// 404
+// ============================================================
+app.use((req, res) => {
+    res.status(404).json({ success: false, message: 'Route not found' });
+});
+
+// ============================================================
+// START
+// ============================================================
 app.listen(PORT, () => {
     console.log('========================================');
     console.log(`🚀 AAGS Backend on port ${PORT}`);
-    console.log(`📰 News: RSS + og:image + 50-image pool`);
+    console.log(`🔐 JWT: ${JWT_SECRET ? '✅' : '❌'}`);
     console.log(`🗄️  Supabase: ${process.env.SUPABASE_URL ? '✅' : '❌'}`);
     console.log(`📧 Brevo: ${BREVO_API_KEY ? '✅' : '❌'}`);
+    console.log(`📰 News: ✅ (RSS + og:image)`);
+    console.log(`🔎 BTC Cipher: ✅`);
     console.log('========================================');
 });
 

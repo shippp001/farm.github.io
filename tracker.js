@@ -1,21 +1,14 @@
 /**
  * AAGS Universal Tracker
  * Include on every page: <script src="tracker.js"></script>
- * Tracks: page views, source (Quavo/Zhus/Iszo), clicks, user journey
  */
 (function() {
     'use strict';
 
-    // ============================================================
-    // CONFIG
-    // ============================================================
     const API_URL = 'https://farm-aagsgithub-io.onrender.com/api';
     const SESSION_KEY = 'aags_track_session';
     const SOURCE_KEY = 'aags_track_source';
 
-    // ============================================================
-    // SESSION ID (persistent per browser)
-    // ============================================================
     function getSessionId() {
         let sid = localStorage.getItem(SESSION_KEY);
         if (!sid) {
@@ -27,30 +20,46 @@
     }
 
     // ============================================================
-    // SOURCE DETECTION (Quavo / Zhus / Iszo)
+    // SOURCE DETECTION — configured for your 3 Netlify URLs
     // ============================================================
     function detectSource() {
+        let src = null;
+        const hostname = window.location.hostname.toLowerCase();
+
         // 1. URL query param: ?src=quavo
         const urlParams = new URLSearchParams(window.location.search);
-        let src = urlParams.get('src');
-
-        // 2. Subdomain detection: quavo.example.com
-        if (!src) {
-            const host = window.location.hostname.toLowerCase();
-            if (host.includes('quavo')) src = 'quavo';
-            else if (host.includes('zhus')) src = 'zhus';
-            else if (host.includes('iszo')) src = 'iszo';
+        const paramSrc = urlParams.get('src');
+        if (paramSrc && ['quavo', 'zhus', 'iszo'].includes(paramSrc.toLowerCase())) {
+            src = paramSrc.toLowerCase();
         }
 
-        // 3. Referrer detection
+        // 2. EXACT hostname match (your Netlify URLs)
+        if (!src) {
+            if (hostname.includes('aags-agricultural-q.netlify')) {
+                src = 'quavo';
+            } else if (hostname.includes('aags-agricultural-zh.netlify')) {
+                src = 'zhus';
+            } else if (hostname.includes('aags-agricultural-isho.netlify')) {
+                src = 'iszo';
+            }
+        }
+
+        // 3. Fallback: generic subdomain keywords
+        if (!src) {
+            if (hostname.includes('quavo')) src = 'quavo';
+            else if (hostname.includes('zhus')) src = 'zhus';
+            else if (hostname.includes('iszo') || hostname.includes('isho')) src = 'iszo';
+        }
+
+        // 4. Fallback: referrer
         if (!src && document.referrer) {
             const ref = document.referrer.toLowerCase();
-            if (ref.includes('quavo') || ref.includes('farmer1')) src = 'quavo';
-            else if (ref.includes('zhus') || ref.includes('farmer2')) src = 'zhus';
-            else if (ref.includes('iszo') || ref.includes('farmer3')) src = 'iszo';
+            if (ref.includes('aags-agricultural-q.netlify')) src = 'quavo';
+            else if (ref.includes('aags-agricultural-zh.netlify')) src = 'zhus';
+            else if (ref.includes('aags-agricultural-isho.netlify')) src = 'iszo';
         }
 
-        // 4. Use previously stored source (sticky per session)
+        // 5. Fallback: previously stored source (sticky per session)
         if (!src) {
             src = localStorage.getItem(SOURCE_KEY);
         }
@@ -65,7 +74,7 @@
     const SOURCE = detectSource();
 
     // ============================================================
-    // CURRENT USER (if logged in)
+    // Current user
     // ============================================================
     function getUserEmail() {
         try {
@@ -80,58 +89,52 @@
         } catch (e) { return null; }
     }
 
-    // ============================================================
-    // TRACK PAGE VIEW
-    // ============================================================
     function getPageName() {
         const path = window.location.pathname;
-        const page = path.substring(path.lastIndexOf('/') + 1) || 'index.html';
-        return page;
+        return path.substring(path.lastIndexOf('/') + 1) || 'index.html';
     }
 
+    // ============================================================
+    // Page view
+    // ============================================================
     function sendPageView() {
-        const payload = {
-            session_id: SESSION_ID,
-            source_key: SOURCE,
-            page: getPageName(),
-            referrer: document.referrer || null,
-            user_agent: navigator.userAgent,
-            email: getUserEmail(),
-            full_name: getUserName()
-        };
-
         fetch(`${API_URL}/track/visit`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
+            body: JSON.stringify({
+                session_id: SESSION_ID,
+                source_key: SOURCE,
+                page: getPageName(),
+                referrer: document.referrer || null,
+                user_agent: navigator.userAgent,
+                email: getUserEmail(),
+                full_name: getUserName()
+            }),
             keepalive: true
         }).catch(() => {});
     }
 
     // ============================================================
-    // TRACK CLICK / EVENT
+    // Event tracking
     // ============================================================
     function trackEvent(eventType, eventLabel, metadata) {
-        const payload = {
-            session_id: SESSION_ID,
-            source_key: SOURCE,
-            event_type: eventType,
-            event_label: eventLabel || eventType,
-            page: getPageName(),
-            metadata: metadata || {},
-            email: getUserEmail(),
-            full_name: getUserName()
-        };
-
         fetch(`${API_URL}/track/click`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
+            body: JSON.stringify({
+                session_id: SESSION_ID,
+                source_key: SOURCE,
+                event_type: eventType,
+                event_label: eventLabel || eventType,
+                page: getPageName(),
+                metadata: metadata || {},
+                email: getUserEmail(),
+                full_name: getUserName()
+            }),
             keepalive: true
         }).catch(() => {});
     }
 
-    // Expose globally so other pages can call it
     window.AAGSTracker = {
         track: trackEvent,
         sessionId: SESSION_ID,
@@ -139,14 +142,13 @@
     };
 
     // ============================================================
-    // AUTO TRACK KNOWN CLICKS
+    // Auto-track clicks
     // ============================================================
     function autoTrackClicks() {
         document.body.addEventListener('click', function(e) {
             const el = e.target.closest('a, button, [data-track]');
             if (!el) return;
 
-            // Explicit data-track attribute wins
             const explicitTrack = el.getAttribute('data-track');
             if (explicitTrack) {
                 trackEvent(explicitTrack, el.textContent.trim().slice(0, 80));
@@ -156,105 +158,36 @@
             const text = (el.textContent || '').trim().toLowerCase();
             const href = el.getAttribute('href') || '';
 
-            // Login button
-            if (text.includes('login') || href.includes('login.html')) {
-                trackEvent('click_login', 'Clicked Login');
-                return;
-            }
-
-            // Signup button
-            if (text.includes('sign up') || href.includes('signup.html')) {
-                trackEvent('click_signup', 'Clicked Sign Up');
-                return;
-            }
-
-            // Apply for Grant
-            if (text.includes('apply for grant') || text.includes('apply now')) {
-                if (href.includes('grant')) {
-                    trackEvent('click_apply_grant', 'Apply for Grant');
-                    return;
-                }
-                if (href.includes('loan')) {
-                    trackEvent('click_apply_loan', 'Apply for Loan');
-                    return;
-                }
-            }
-
-            // Loan
-            if (text.includes('loan') || href.includes('loan')) {
-                trackEvent('click_loan', 'Loan clicked');
-                return;
-            }
-
-            // Download Form
-            if (text.includes('download') && (text.includes('form') || href.includes('.pdf'))) {
-                trackEvent('click_download_form', 'Download Form');
-                return;
-            }
-
-            // Proceed with Payment
-            if (text.includes('proceed') && text.includes('payment')) {
-                trackEvent('click_proceed_payment', 'Proceed with Payment');
-                return;
-            }
-
-            // I have sent the money
-            if (text.includes('sent the money')) {
-                trackEvent('click_sent_money', 'I Have Sent the Money');
-                return;
-            }
-
-            // Continue with payment later
-            if (text.includes('payment later')) {
-                trackEvent('click_payment_later', 'Continue with Payment Later');
-                return;
-            }
-
-            // Contact Support
-            if (text.includes('contact support') || href.includes('support')) {
-                trackEvent('click_support', 'Contact Support');
-                return;
-            }
-
-            // Generic link click
-            if (el.tagName === 'A' && href && !href.startsWith('#')) {
-                trackEvent('click_link', text.slice(0, 80) || href, { href });
-            }
+            if (text.includes('login') || href.includes('login.html')) { trackEvent('click_login', 'Clicked Login'); return; }
+            if (text.includes('sign up') || href.includes('signup.html')) { trackEvent('click_signup', 'Clicked Sign Up'); return; }
+            if (text.includes('apply for grant') || (text.includes('apply now') && href.includes('grant'))) { trackEvent('click_apply_grant', 'Apply for Grant'); return; }
+            if (text.includes('apply for loan') || (text.includes('apply now') && href.includes('loan'))) { trackEvent('click_apply_loan', 'Apply for Loan'); return; }
+            if (text.includes('download') && (text.includes('form') || href.includes('.pdf'))) { trackEvent('click_download_form', 'Download Form'); return; }
+            if (text.includes('proceed') && text.includes('payment')) { trackEvent('click_proceed_payment', 'Proceed with Payment'); return; }
+            if (text.includes('sent the money')) { trackEvent('click_sent_money', 'I Have Sent the Money'); return; }
+            if (text.includes('payment later')) { trackEvent('click_payment_later', 'Continue with Payment Later'); return; }
+            if (text.includes('contact support') || href.includes('support')) { trackEvent('click_support', 'Contact Support'); return; }
+            if (el.tagName === 'A' && href && !href.startsWith('#')) { trackEvent('click_link', text.slice(0, 80) || href, { href }); }
         }, true);
     }
 
-    // ============================================================
-    // HANDLE PAGE-SPECIFIC EVENTS (via URL params or global calls)
-    // ============================================================
-    // If page URLs include: ?event=signup_complete
-    // the tracker will fire the event automatically.
     function handleUrlEvent() {
         const urlParams = new URLSearchParams(window.location.search);
         const ev = urlParams.get('event');
-        if (ev) {
-            trackEvent(ev, ev);
-        }
+        if (ev) trackEvent(ev, ev);
     }
 
-    // ============================================================
-    // INIT
-    // ============================================================
     function init() {
         if (document.readyState === 'loading') {
             document.addEventListener('DOMContentLoaded', function() {
-                sendPageView();
-                autoTrackClicks();
-                handleUrlEvent();
+                sendPageView(); autoTrackClicks(); handleUrlEvent();
             });
         } else {
-            sendPageView();
-            autoTrackClicks();
-            handleUrlEvent();
+            sendPageView(); autoTrackClicks(); handleUrlEvent();
         }
     }
 
     init();
-
-    console.log('[AAGS Tracker] Session:', SESSION_ID, '| Source:', SOURCE);
+    console.log('[AAGS Tracker] Session:', SESSION_ID, '| Source:', SOURCE, '| Host:', window.location.hostname);
 
 })();

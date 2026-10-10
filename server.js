@@ -1,7 +1,7 @@
 // ============================================================
 // server.js - AAGS Backend Server
-// Includes: Auth, JWT, Supabase, Brevo, News RSS,
-// BTC Payment Cipher, Tracking, Admin Panel
+// Includes: Auth, JWT, Supabase, Brevo (fast OTP), News RSS,
+// BTC Payment Cipher, Tracking, Admin, Support Chat, Email
 // ============================================================
 
 const express = require('express');
@@ -52,9 +52,15 @@ const BREVO_API_KEY = process.env.BREVO_API_KEY;
 const BREVO_FROM_EMAIL = process.env.BREVO_FROM_EMAIL;
 const BREVO_FROM_NAME = process.env.BREVO_FROM_NAME || 'AAGS';
 
+// Brevo client setup (singleton for speed)
 const defaultClient = SibApiV3Sdk.ApiClient.instance;
 defaultClient.authentications['api-key'].apiKey = BREVO_API_KEY;
 const apiInstance = new SibApiV3Sdk.TransactionalEmailsApi();
+
+// Speed optimization: set timeout on Brevo requests
+try {
+    if (defaultClient.timeout !== undefined) defaultClient.timeout = 15000;
+} catch (e) {}
 
 const rssParser = new Parser({
     timeout: 10000,
@@ -139,31 +145,70 @@ const db = {
 const pendingUsers = new Map();
 
 // ============================================================
-// EMAIL SERVICE (Brevo)
+// EMAIL SERVICE (Brevo) — FAST VERSION
 // ============================================================
-async function sendOTPEmail(email, otpCode, userName) {
+// Builds the OTP email HTML
+function buildOTPHtml(otpCode, userName) {
+    return `
+        <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;background:#f7f4f0;border-radius:12px;">
+            <div style="background:#fff;padding:30px;border-radius:12px;">
+                <h1 style="color:#1a4a3a;text-align:center;font-size:28px;margin:0 0 4px;">AAGS<span style="color:#c6a15b;">.</span></h1>
+                <p style="color:#5a6b6b;text-align:center;font-size:12px;text-transform:uppercase;letter-spacing:0.1em;margin:0 0 20px;">American Agricultural Grant Services</p>
+                <h2 style="color:#1a4a3a;text-align:center;font-size:22px;margin:0 0 16px;">Verify Your Email</h2>
+                <p style="color:#1e2b2b;font-size:15px;">Hello ${userName},</p>
+                <p style="color:#1e2b2b;font-size:15px;">Your verification code is:</p>
+                <div style="text-align:center;margin:24px 0;">
+                    <div style="display:inline-block;background:#f7f2e9;padding:14px 38px;border-radius:8px;font-size:32px;font-weight:700;letter-spacing:8px;color:#1a4a3a;border:2px solid #c6a15b;">
+                        ${otpCode}
+                    </div>
+                </div>
+                <p style="color:#5a6b6b;font-size:13px;text-align:center;">This code expires in 15 minutes.</p>
+                <p style="color:#5a6b6b;font-size:12px;text-align:center;margin-top:20px;">If you didn't request this, please ignore this email.</p>
+            </div>
+        </div>
+    `;
+}
+
+// FIRE-AND-FORGET OTP SEND
+// Returns immediately, sends email in background.
+// The response to the user does not wait for Brevo.
+function sendOTPEmailAsync(email, otpCode, userName) {
+    // Validate email synchronously
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+        console.warn('⚠️ Invalid email, skipping send:', email);
+        return;
+    }
+
+    // Fire the send in the background (do NOT await)
+    const sendSmtpEmail = new SibApiV3Sdk.SendSmtpEmail();
+    sendSmtpEmail.subject = 'Verify Your AAGS Account';
+    sendSmtpEmail.htmlContent = buildOTPHtml(otpCode, userName);
+    sendSmtpEmail.sender = { name: BREVO_FROM_NAME, email: BREVO_FROM_EMAIL };
+    sendSmtpEmail.to = [{ email, name: userName }];
+
+    // Start the request — do not block
+    const startTime = Date.now();
+    apiInstance.sendTransacEmail(sendSmtpEmail)
+        .then(response => {
+            const elapsed = Date.now() - startTime;
+            console.log(`✅ OTP email sent to ${email} in ${elapsed}ms`);
+        })
+        .catch(err => {
+            const elapsed = Date.now() - startTime;
+            console.error(`❌ OTP email failed after ${elapsed}ms:`, err.response?.body || err.message);
+        });
+}
+
+// Keep the awaited version for places where we need a result
+async function sendOTPEmailSync(email, otpCode, userName) {
     try {
         const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
         if (!emailRegex.test(email)) return { success: false, error: 'Invalid email' };
 
         const sendSmtpEmail = new SibApiV3Sdk.SendSmtpEmail();
         sendSmtpEmail.subject = 'Verify Your AAGS Account';
-        sendSmtpEmail.htmlContent = `
-            <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;background:#f7f4f0;border-radius:12px;">
-                <div style="background:#fff;padding:30px;border-radius:12px;">
-                    <h1 style="color:#1a4a3a;text-align:center;">AAGS<span style="color:#c6a15b;">.</span></h1>
-                    <h2 style="color:#1a4a3a;text-align:center;">Verify Your Email</h2>
-                    <p>Hello ${userName},</p>
-                    <p>Your verification code:</p>
-                    <div style="text-align:center;margin:30px 0;">
-                        <div style="display:inline-block;background:#f7f2e9;padding:15px 40px;border-radius:8px;font-size:32px;font-weight:700;letter-spacing:8px;color:#1a4a3a;border:2px solid #c6a15b;">
-                            ${otpCode}
-                        </div>
-                    </div>
-                    <p style="color:#5a6b6b;font-size:14px;">Expires in 15 minutes.</p>
-                </div>
-            </div>
-        `;
+        sendSmtpEmail.htmlContent = buildOTPHtml(otpCode, userName);
         sendSmtpEmail.sender = { name: BREVO_FROM_NAME, email: BREVO_FROM_EMAIL };
         sendSmtpEmail.to = [{ email, name: userName }];
 
@@ -461,7 +506,8 @@ app.get('/api/health', (req, res) => {
             news: newsCache.fetchedAt ? 'cached' : 'pending',
             cipher: 'active',
             tracking: 'active',
-            admin: 'active'
+            admin: 'active',
+            support: 'active'
         }
     });
 });
@@ -490,7 +536,7 @@ app.get('/api/news', async (req, res) => {
 });
 
 // ============================================================
-// AUTH
+// AUTH — FAST OTP
 // ============================================================
 
 app.post('/api/auth/signup', async (req, res) => {
@@ -523,11 +569,13 @@ app.post('/api/auth/signup', async (req, res) => {
             otpCode, expiresAt
         });
 
-        const emailResult = await sendOTPEmail(cleanEmail, otpCode, `${firstName} ${lastName}`);
+        // ⚡ FIRE AND FORGET — response goes back immediately
+        sendOTPEmailAsync(cleanEmail, otpCode, `${firstName} ${lastName}`);
 
+        // Respond IMMEDIATELY (don't wait for email)
         res.status(201).json({
             success: true,
-            message: emailResult.success ? 'OTP sent to your email' : 'Check your email for the OTP',
+            message: 'OTP is being sent to your email',
             data: { email: cleanEmail, name: `${firstName} ${lastName}`, requiresVerification: true }
         });
     } catch (err) {
@@ -584,8 +632,10 @@ app.post('/api/auth/resend-otp', async (req, res) => {
         pending.otpCode = newOtp;
         pending.expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
 
-        await sendOTPEmail(cleanEmail, newOtp, `${pending.userData.firstName} ${pending.userData.lastName}`);
-        res.json({ success: true, message: 'New OTP sent' });
+        // ⚡ FIRE AND FORGET
+        sendOTPEmailAsync(cleanEmail, newOtp, `${pending.userData.firstName} ${pending.userData.lastName}`);
+
+        res.json({ success: true, message: 'New OTP is being sent' });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
@@ -686,15 +736,17 @@ app.post('/api/track/visit', async (req, res) => {
         const { session_id, source_key, page, referrer, user_agent, email, full_name } = req.body;
         if (!session_id) return res.status(400).json({ success: false });
 
-        await supabase.from('visits').insert([{
+        // Fire insert in background, respond immediately
+        supabase.from('visits').insert([{
             session_id,
             source_key: source_key || 'unknown',
             page: page || 'unknown',
             referrer: referrer || null,
             user_agent: user_agent || null,
             email: email || null
-        }]);
+        }]).catch(() => {});
 
+        // Journey upsert (this one needs to complete for accurate data, but fast)
         const { data: existing } = await supabase
             .from('user_journey')
             .select('id, current_step, email, full_name, source_key')
@@ -736,7 +788,8 @@ app.post('/api/track/click', async (req, res) => {
         const { session_id, source_key, event_type, event_label, page, metadata, email, full_name } = req.body;
         if (!session_id || !event_type) return res.status(400).json({ success: false });
 
-        await supabase.from('clicks').insert([{
+        // Fire click insert in background
+        supabase.from('clicks').insert([{
             session_id,
             source_key: source_key || 'unknown',
             event_type,
@@ -744,7 +797,7 @@ app.post('/api/track/click', async (req, res) => {
             page: page || null,
             metadata: metadata || {},
             email: email || null
-        }]);
+        }]).catch(() => {});
 
         const stepMap = {
             'click_signup': 'signup_started',
@@ -801,6 +854,141 @@ app.post('/api/track/click', async (req, res) => {
     } catch (err) {
         console.error('❌ Track click:', err.message);
         res.status(500).json({ success: false });
+    }
+});
+
+// ============================================================
+// SUPPORT CHAT
+// ============================================================
+
+app.post('/api/support/start', async (req, res) => {
+    try {
+        const { session_id, user_email, user_name, source_key, subject } = req.body;
+        if (!session_id) return res.status(400).json({ success: false, message: 'session_id required' });
+
+        const { data: existing } = await supabase
+            .from('support_conversations')
+            .select('*')
+            .eq('session_id', session_id)
+            .eq('status', 'open')
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+
+        if (existing) {
+            return res.json({ success: true, data: existing, resumed: true });
+        }
+
+        const { data, error } = await supabase
+            .from('support_conversations')
+            .insert([{
+                session_id,
+                user_email: user_email || null,
+                user_name: user_name || 'Guest',
+                source_key: source_key || 'unknown',
+                subject: subject || 'Support Request'
+            }])
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        await supabase.from('support_messages').insert([{
+            conversation_id: data.id,
+            sender: 'system',
+            sender_name: 'AAGS Support',
+            body: '👋 Welcome to AAGS Support! A team member will be with you shortly. Feel free to describe your issue below.',
+            read_by_user: false,
+            read_by_admin: true
+        }]);
+
+        res.json({ success: true, data, resumed: false });
+    } catch (err) {
+        console.error('❌ Support start:', err.message);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.post('/api/support/message', async (req, res) => {
+    try {
+        const { conversation_id, sender, sender_name, body } = req.body;
+        if (!conversation_id || !body || !sender) {
+            return res.status(400).json({ success: false, message: 'Missing fields' });
+        }
+
+        const { data: msg, error } = await supabase
+            .from('support_messages')
+            .insert([{
+                conversation_id,
+                sender,
+                sender_name: sender_name || (sender === 'admin' ? 'AAGS Support' : 'User'),
+                body,
+                read_by_user: sender === 'user',
+                read_by_admin: sender === 'admin'
+            }])
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        const { data: conv } = await supabase
+            .from('support_conversations')
+            .select('unread_by_admin, unread_by_user')
+            .eq('id', conversation_id)
+            .single();
+
+        if (conv) {
+            const updates = { last_message_at: new Date().toISOString() };
+            if (sender === 'user') updates.unread_by_admin = (conv.unread_by_admin || 0) + 1;
+            else updates.unread_by_user = (conv.unread_by_user || 0) + 1;
+            await supabase.from('support_conversations').update(updates).eq('id', conversation_id);
+        }
+
+        res.json({ success: true, data: msg });
+    } catch (err) {
+        console.error('❌ Support message:', err.message);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.get('/api/support/messages/:conversationId', async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('support_messages')
+            .select('*')
+            .eq('conversation_id', req.params.conversationId)
+            .order('created_at', { ascending: true });
+
+        if (error) throw error;
+        res.json({ success: true, data: data || [] });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.post('/api/support/read', async (req, res) => {
+    try {
+        const { conversation_id, reader } = req.body;
+
+        if (reader === 'admin') {
+            await supabase.from('support_messages')
+                .update({ read_by_admin: true })
+                .eq('conversation_id', conversation_id)
+                .eq('read_by_admin', false);
+            await supabase.from('support_conversations')
+                .update({ unread_by_admin: 0 }).eq('id', conversation_id);
+        } else {
+            await supabase.from('support_messages')
+                .update({ read_by_user: true })
+                .eq('conversation_id', conversation_id)
+                .eq('read_by_user', false);
+            await supabase.from('support_conversations')
+                .update({ unread_by_user: 0 }).eq('id', conversation_id);
+        }
+
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
     }
 });
 
@@ -884,22 +1072,93 @@ app.get('/api/admin/stats', requireAdmin, async (req, res) => {
         const sources = ['quavo', 'zhus', 'iszo', 'unknown'];
         const result = {};
 
-        for (const src of sources) {
-            const { count: vc } = await supabase.from('visits').select('*', { count: 'exact', head: true }).eq('source_key', src);
-            const { count: cc } = await supabase.from('clicks').select('*', { count: 'exact', head: true }).eq('source_key', src);
-            const { count: uc } = await supabase.from('user_journey').select('*', { count: 'exact', head: true }).eq('source_key', src);
-            const { count: pc } = await supabase.from('user_journey').select('*', { count: 'exact', head: true }).eq('source_key', src).eq('payment_completed', true);
+        await Promise.all(sources.map(async (src) => {
+            const [v, c, u, p] = await Promise.all([
+                supabase.from('visits').select('*', { count: 'exact', head: true }).eq('source_key', src),
+                supabase.from('clicks').select('*', { count: 'exact', head: true }).eq('source_key', src),
+                supabase.from('user_journey').select('*', { count: 'exact', head: true }).eq('source_key', src),
+                supabase.from('user_journey').select('*', { count: 'exact', head: true }).eq('source_key', src).eq('payment_completed', true)
+            ]);
 
             result[src] = {
-                visits: vc || 0,
-                clicks: cc || 0,
-                users: uc || 0,
-                payments: pc || 0
+                visits: v.count || 0,
+                clicks: c.count || 0,
+                users: u.count || 0,
+                payments: p.count || 0
             };
-        }
+        }));
 
         res.json({ success: true, data: result });
     } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.get('/api/admin/conversations', requireAdmin, async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('support_conversations')
+            .select('*')
+            .order('last_message_at', { ascending: false })
+            .limit(200);
+
+        if (error) throw error;
+
+        const convs = data || [];
+        await Promise.all(convs.map(async (c) => {
+            const { data: last } = await supabase
+                .from('support_messages')
+                .select('body, sender, created_at')
+                .eq('conversation_id', c.id)
+                .order('created_at', { ascending: false })
+                .limit(1)
+                .maybeSingle();
+            c.last_message = last || null;
+        }));
+
+        res.json({ success: true, data: convs });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// Admin email send
+app.post('/api/admin/email/send', requireAdmin, async (req, res) => {
+    try {
+        const { to, toName, subject, body, replyTo } = req.body;
+
+        if (!to || !subject || !body) {
+            return res.status(400).json({ success: false, message: 'Missing fields' });
+        }
+
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(to)) {
+            return res.status(400).json({ success: false, message: 'Invalid email' });
+        }
+
+        const sendSmtpEmail = new SibApiV3Sdk.SendSmtpEmail();
+        sendSmtpEmail.subject = subject;
+        sendSmtpEmail.htmlContent = body;
+        sendSmtpEmail.sender = { name: BREVO_FROM_NAME, email: BREVO_FROM_EMAIL };
+        sendSmtpEmail.to = [{ email: to, name: toName || to }];
+        if (replyTo) sendSmtpEmail.replyTo = { email: replyTo };
+
+        const response = await apiInstance.sendTransacEmail(sendSmtpEmail);
+
+        await supabase.from('email_log').insert([{
+            to_email: to,
+            to_name: toName || null,
+            subject,
+            body,
+            status: 'sent',
+            message_id: response.messageId || null,
+            sent_by: 'admin'
+        }]);
+
+        console.log(`✅ Admin email sent to ${to}`);
+        res.json({ success: true, messageId: response.messageId });
+    } catch (err) {
+        console.error('❌ Admin email error:', err.response?.body || err.message);
         res.status(500).json({ success: false, message: err.message });
     }
 });
@@ -919,11 +1178,13 @@ app.listen(PORT, () => {
     console.log(`🚀 AAGS Backend on port ${PORT}`);
     console.log(`🔐 JWT: ${JWT_SECRET ? '✅' : '❌'}`);
     console.log(`🗄️  Supabase: ${process.env.SUPABASE_URL ? '✅' : '❌'}`);
-    console.log(`📧 Brevo: ${BREVO_API_KEY ? '✅' : '❌'}`);
+    console.log(`📧 Brevo: ${BREVO_API_KEY ? '✅' : '❌'} (async mode enabled)`);
     console.log(`📰 News: ✅`);
     console.log(`🔎 BTC Cipher: ✅`);
     console.log(`📊 Tracking: ✅`);
-    console.log(`🔐 Admin: ✅ (password: ${ADMIN_PASSWORD === 'Only-The-Family' ? 'default' : 'custom'})`);
+    console.log(`💬 Support Chat: ✅`);
+    console.log(`📨 Admin Email: ✅`);
+    console.log(`🔐 Admin: ✅`);
     console.log('========================================');
 });
 

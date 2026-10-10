@@ -1,11 +1,7 @@
 // ============================================================
 // server.js - AAGS Backend Server
-// Full integrations:
-//   - Supabase (users, otp, grant applications)
-//   - Brevo API (OTP emails)
-//   - Live News RSS (Google News, no API key)
-//   - BTC Payment Cipher (Blockchain.com verification)
-//   - JWT authentication
+// Includes: Auth, JWT, Supabase, Brevo, News RSS,
+// BTC Payment Cipher, Tracking, Admin Panel
 // ============================================================
 
 const express = require('express');
@@ -44,15 +40,14 @@ if (missingVars.length > 0) {
 // ============================================================
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_EXPIRY = '7d';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'Only-The-Family';
 
-// Supabase
 const supabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_SERVICE_KEY,
     { auth: { autoRefreshToken: false, persistSession: false } }
 );
 
-// Brevo
 const BREVO_API_KEY = process.env.BREVO_API_KEY;
 const BREVO_FROM_EMAIL = process.env.BREVO_FROM_EMAIL;
 const BREVO_FROM_NAME = process.env.BREVO_FROM_NAME || 'AAGS';
@@ -61,7 +56,6 @@ const defaultClient = SibApiV3Sdk.ApiClient.instance;
 defaultClient.authentications['api-key'].apiKey = BREVO_API_KEY;
 const apiInstance = new SibApiV3Sdk.TransactionalEmailsApi();
 
-// RSS
 const rssParser = new Parser({
     timeout: 10000,
     headers: { 'User-Agent': 'Mozilla/5.0 (compatible; AAGS-Bot/1.0)' }
@@ -80,7 +74,7 @@ app.use((req, res, next) => {
     next();
 });
 
-app.use('/api/', rateLimit({ windowMs: 15 * 60 * 1000, max: 300 }));
+app.use('/api/', rateLimit({ windowMs: 15 * 60 * 1000, max: 500 }));
 
 // ============================================================
 // DATABASE HELPERS
@@ -134,7 +128,7 @@ const db = {
                 created_at: new Date().toISOString()
             }]).select().single();
             if (error) {
-                console.warn('⚠️ Application insert failed (table may not exist):', error.message);
+                console.warn('⚠️ Application insert failed:', error.message);
                 return null;
             }
             return data;
@@ -142,7 +136,6 @@ const db = {
     }
 };
 
-// Pending signups
 const pendingUsers = new Map();
 
 // ============================================================
@@ -206,6 +199,13 @@ function authenticateToken(req, res, next) {
     req.user = decoded;
     next();
 }
+function requireAdmin(req, res, next) {
+    const auth = req.headers['x-admin-key'];
+    if (auth !== ADMIN_PASSWORD) {
+        return res.status(401).json({ success: false, message: 'Unauthorized' });
+    }
+    next();
+}
 
 // ============================================================
 // NEWS RSS FEEDS
@@ -221,7 +221,6 @@ const NEWS_FEEDS = [
 
 let newsCache = { articles: [], fetchedAt: null };
 
-// Image pool for fallback (50 unique agricultural images)
 const IMAGE_POOL = [
     'https://images.unsplash.com/photo-1500595046743-cd271d694d30?w=600&h=400&fit=crop',
     'https://images.unsplash.com/photo-1592982537447-7440770cbfc9?w=600&h=400&fit=crop',
@@ -232,17 +231,7 @@ const IMAGE_POOL = [
     'https://images.unsplash.com/photo-1523348837708-15d4a09cfac2?w=600&h=400&fit=crop',
     'https://images.unsplash.com/photo-1530836369250-ef72a3f5cda8?w=600&h=400&fit=crop',
     'https://images.unsplash.com/photo-1464226184884-fa280b87c399?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1516253593875-bd7ba052fbc5?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1492496913980-501348b61469?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1471193945509-9ad0617afabf?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1615729947596-a598e5de0ab3?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1620200423727-8127f75d7f53?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1605000797499-95a51c5269ae?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1595855759920-86582396756a?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1622383563227-04401ab4e5ea?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1495745455409-ff12e0ce45a4?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1518977676601-b53f82aba655?w=600&h=400&fit=crop',
-    'https://images.unsplash.com/photo-1574943320219-553eb213f72d?w=600&h=400&fit=crop'
+    'https://images.unsplash.com/photo-1516253593875-bd7ba052fbc5?w=600&h=400&fit=crop'
 ];
 
 function hashString(str) {
@@ -253,7 +242,6 @@ function hashString(str) {
     }
     return Math.abs(hash);
 }
-
 function pickUniqueImage(title, usedIndices) {
     const startIdx = hashString(title || 'x') % IMAGE_POOL.length;
     let idx = startIdx;
@@ -267,35 +255,23 @@ function pickUniqueImage(title, usedIndices) {
 }
 
 const ogImageCache = new Map();
-
 async function fetchOgImage(url, timeout = 6000) {
     if (!url) return null;
     if (ogImageCache.has(url)) return ogImageCache.get(url);
-
     try {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), timeout);
-
         const res = await fetch(url, {
             redirect: 'follow',
             signal: controller.signal,
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Accept': 'text/html'
-            }
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', 'Accept': 'text/html' }
         });
         clearTimeout(timer);
-
-        if (!res.ok) {
-            ogImageCache.set(url, null);
-            return null;
-        }
-
+        if (!res.ok) { ogImageCache.set(url, null); return null; }
         const html = await res.text();
         const match = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i)
             || html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i)
             || html.match(/<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i);
-
         const image = match ? match[1] : null;
         ogImageCache.set(url, image);
         return image;
@@ -352,14 +328,12 @@ async function refreshNews() {
     all.sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt));
     const top = all.slice(0, 24);
 
-    // Fetch real og:images in parallel
     await Promise.all(top.map(async (article) => {
         if (article.image) return;
         const og = await fetchOgImage(article.url);
         if (og) article.image = og;
     }));
 
-    // Unique fallback
     const usedIndices = new Set();
     top.forEach(article => {
         if (!article.image) {
@@ -384,12 +358,7 @@ const paymentChecks = new Map();
 app.post('/api/payment/verify-btc', async (req, res) => {
     try {
         const { address, expectedAmountUSD, expectedAmountBTC, txid } = req.body;
-
-        if (!address) {
-            return res.status(400).json({ success: false, message: 'BTC address required' });
-        }
-
-        console.log(`🔎 Cipher check for address: ${address}`);
+        if (!address) return res.status(400).json({ success: false, message: 'BTC address required' });
 
         const cacheKey = address + '|' + (txid || '');
         const cached = paymentChecks.get(cacheKey);
@@ -397,15 +366,10 @@ app.post('/api/payment/verify-btc', async (req, res) => {
             return res.json(cached.data);
         }
 
-        const url = `${BTC_API_BASE}/rawaddr/${address}?limit=20`;
-        const apiRes = await fetch(url, {
+        const apiRes = await fetch(`${BTC_API_BASE}/rawaddr/${address}?limit=20`, {
             headers: { 'User-Agent': 'AAGS-Payment-Cipher/1.0' }
         });
-
-        if (!apiRes.ok) {
-            throw new Error(`Blockchain.com returned ${apiRes.status}`);
-        }
-
+        if (!apiRes.ok) throw new Error(`Blockchain.com returned ${apiRes.status}`);
         const data = await apiRes.json();
 
         const totalReceived = data.total_received || 0;
@@ -439,10 +403,8 @@ app.post('/api/payment/verify-btc', async (req, res) => {
         }
 
         let status = 'awaiting';
-        const minConfirmations = 1;
-
         if (receivedSatoshi > 0) {
-            if (confirmations >= minConfirmations) status = 'confirmed';
+            if (confirmations >= 1) status = 'confirmed';
             else if (confirmations === 0) status = 'pending';
             else status = 'confirming';
         } else if (nTx === 0) {
@@ -474,24 +436,20 @@ app.post('/api/payment/verify-btc', async (req, res) => {
             paymentChecks.delete(oldestKey);
         }
 
-        console.log(`✅ Cipher: ${status} (${confirmations} conf, received: ${result.receivedBTC} BTC)`);
         res.json(result);
-
     } catch (err) {
         console.error('❌ Cipher error:', err.message);
         res.status(500).json({
             success: false,
             status: 'error',
-            message: 'Unable to verify payment at this time. Please try again shortly.'
+            message: 'Unable to verify payment at this time.'
         });
     }
 });
 
 // ============================================================
-// ROUTES
+// HEALTH
 // ============================================================
-
-// Health check
 app.get('/api/health', (req, res) => {
     res.json({
         success: true,
@@ -501,12 +459,16 @@ app.get('/api/health', (req, res) => {
             supabase: 'connected',
             brevo: 'configured',
             news: newsCache.fetchedAt ? 'cached' : 'pending',
-            cipher: 'active'
+            cipher: 'active',
+            tracking: 'active',
+            admin: 'active'
         }
     });
 });
 
-// ===== NEWS =====
+// ============================================================
+// NEWS
+// ============================================================
 app.get('/api/news', async (req, res) => {
     try {
         const stale = !newsCache.fetchedAt ||
@@ -514,13 +476,8 @@ app.get('/api/news', async (req, res) => {
         if (stale || newsCache.articles.length === 0) await refreshNews();
 
         if (newsCache.articles.length === 0) {
-            return res.status(503).json({
-                success: false,
-                message: 'Live news temporarily unavailable. Please try again later.',
-                articles: []
-            });
+            return res.status(503).json({ success: false, message: 'News unavailable', articles: [] });
         }
-
         res.json({
             success: true,
             fetchedAt: newsCache.fetchedAt,
@@ -532,9 +489,10 @@ app.get('/api/news', async (req, res) => {
     }
 });
 
-// ===== AUTH =====
+// ============================================================
+// AUTH
+// ============================================================
 
-// Signup
 app.post('/api/auth/signup', async (req, res) => {
     try {
         const { firstName, middleName, lastName, email, phone, dateOfBirth, gender, country, password } = req.body;
@@ -542,14 +500,12 @@ app.post('/api/auth/signup', async (req, res) => {
         if (!firstName || !lastName || !email || !phone || !dateOfBirth || !country || !password) {
             return res.status(400).json({ success: false, message: 'Missing required fields' });
         }
-
         const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
         if (!emailRegex.test(email)) {
             return res.status(400).json({ success: false, message: 'Invalid email format' });
         }
 
         const cleanEmail = email.trim().toLowerCase();
-
         const existing = await db.users.findByEmail(cleanEmail);
         if (existing) {
             return res.status(409).json({ success: false, message: 'User already exists' });
@@ -564,8 +520,7 @@ app.post('/api/auth/signup', async (req, res) => {
                 email: cleanEmail, phone, dateOfBirth, gender, country,
                 passwordHash: hashPassword(password)
             },
-            otpCode,
-            expiresAt
+            otpCode, expiresAt
         });
 
         const emailResult = await sendOTPEmail(cleanEmail, otpCode, `${firstName} ${lastName}`);
@@ -581,7 +536,6 @@ app.post('/api/auth/signup', async (req, res) => {
     }
 });
 
-// Verify OTP
 app.post('/api/auth/verify-otp', async (req, res) => {
     try {
         const { email, otpCode } = req.body;
@@ -593,7 +547,7 @@ app.post('/api/auth/verify-otp', async (req, res) => {
         if (!pending) return res.status(400).json({ success: false, message: 'No pending signup found' });
         if (new Date(pending.expiresAt) < new Date()) {
             pendingUsers.delete(cleanEmail);
-            return res.status(400).json({ success: false, message: 'OTP expired. Please sign up again.' });
+            return res.status(400).json({ success: false, message: 'OTP expired' });
         }
         if (pending.otpCode !== otpCode) {
             return res.status(400).json({ success: false, message: 'Invalid OTP code' });
@@ -601,7 +555,6 @@ app.post('/api/auth/verify-otp', async (req, res) => {
 
         const user = await db.users.create(pending.userData);
         pendingUsers.delete(cleanEmail);
-
         const token = generateToken(user);
 
         res.json({
@@ -614,12 +567,10 @@ app.post('/api/auth/verify-otp', async (req, res) => {
             }
         });
     } catch (err) {
-        console.error('❌ Verify OTP:', err);
         res.status(500).json({ success: false, message: err.message });
     }
 });
 
-// Resend OTP
 app.post('/api/auth/resend-otp', async (req, res) => {
     try {
         const { email } = req.body;
@@ -634,14 +585,12 @@ app.post('/api/auth/resend-otp', async (req, res) => {
         pending.expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
 
         await sendOTPEmail(cleanEmail, newOtp, `${pending.userData.firstName} ${pending.userData.lastName}`);
-
         res.json({ success: true, message: 'New OTP sent' });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
 });
 
-// Login
 app.post('/api/auth/login', async (req, res) => {
     try {
         const { email, password } = req.body;
@@ -649,7 +598,6 @@ app.post('/api/auth/login', async (req, res) => {
 
         const user = await db.users.findByEmail(email.trim().toLowerCase());
         if (!user) return res.status(401).json({ success: false, message: 'Invalid email or password' });
-
         if (!comparePassword(password, user.password_hash)) {
             return res.status(401).json({ success: false, message: 'Invalid email or password' });
         }
@@ -671,7 +619,6 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
-// Verify token
 app.post('/api/auth/verify-token', async (req, res) => {
     try {
         const { token } = req.body;
@@ -692,7 +639,6 @@ app.post('/api/auth/verify-token', async (req, res) => {
     }
 });
 
-// Get current user
 app.get('/api/user/me', authenticateToken, async (req, res) => {
     try {
         const user = await db.users.findById(req.user.userId);
@@ -712,25 +658,248 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
     }
 });
 
-// ===== GRANT APPLICATION =====
-
+// ============================================================
+// GRANT APPLICATION
+// ============================================================
 app.post('/api/grants/apply', async (req, res) => {
     try {
         const { refNumber, userId, email, formData, selections, uploadedFiles } = req.body;
-
-        console.log('📄 Grant application submission:', refNumber);
-
         const result = await db.applications.create({
             refNumber, userId, email, formData, selections, uploadedFiles
         });
-
         res.json({
             success: true,
             message: 'Application submitted successfully',
             data: result || { refNumber }
         });
     } catch (err) {
-        console.error('❌ Grant application error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// ============================================================
+// TRACKING
+// ============================================================
+
+app.post('/api/track/visit', async (req, res) => {
+    try {
+        const { session_id, source_key, page, referrer, user_agent, email, full_name } = req.body;
+        if (!session_id) return res.status(400).json({ success: false });
+
+        await supabase.from('visits').insert([{
+            session_id,
+            source_key: source_key || 'unknown',
+            page: page || 'unknown',
+            referrer: referrer || null,
+            user_agent: user_agent || null,
+            email: email || null
+        }]);
+
+        const { data: existing } = await supabase
+            .from('user_journey')
+            .select('id, current_step, email, full_name, source_key')
+            .eq('session_id', session_id)
+            .maybeSingle();
+
+        if (!existing) {
+            await supabase.from('user_journey').insert([{
+                session_id,
+                source_key: source_key || 'unknown',
+                email: email || null,
+                full_name: full_name || null,
+                current_step: 'visitor',
+                last_page: page,
+                first_seen_at: new Date().toISOString(),
+                last_seen_at: new Date().toISOString()
+            }]);
+        } else {
+            const updates = {
+                last_seen_at: new Date().toISOString(),
+                last_page: page
+            };
+            if (email && !existing.email) updates.email = email;
+            if (full_name && !existing.full_name) updates.full_name = full_name;
+            if (source_key && existing.source_key === 'unknown') updates.source_key = source_key;
+
+            await supabase.from('user_journey').update(updates).eq('id', existing.id);
+        }
+
+        res.json({ success: true });
+    } catch (err) {
+        console.error('❌ Track visit:', err.message);
+        res.status(500).json({ success: false });
+    }
+});
+
+app.post('/api/track/click', async (req, res) => {
+    try {
+        const { session_id, source_key, event_type, event_label, page, metadata, email, full_name } = req.body;
+        if (!session_id || !event_type) return res.status(400).json({ success: false });
+
+        await supabase.from('clicks').insert([{
+            session_id,
+            source_key: source_key || 'unknown',
+            event_type,
+            event_label: event_label || event_type,
+            page: page || null,
+            metadata: metadata || {},
+            email: email || null
+        }]);
+
+        const stepMap = {
+            'click_signup': 'signup_started',
+            'signup_complete': 'otp_pending',
+            'otp_verified': 'registered',
+            'click_download_form': 'grant_downloaded',
+            'download_form': 'grant_downloaded',
+            'upload_form_complete': 'form_uploaded',
+            'face_verified': 'face_verified',
+            'click_proceed_payment': 'payment_started',
+            'payment_started': 'payment_started',
+            'payment_completed': 'payment_completed'
+        };
+
+        const flagMap = {
+            'signup_complete': 'signup_completed',
+            'otp_verified': 'otp_verified',
+            'download_form': 'grant_form_downloaded',
+            'upload_form_complete': 'form_uploaded',
+            'face_verified': 'face_verified',
+            'payment_started': 'payment_started',
+            'payment_completed': 'payment_completed'
+        };
+
+        const { data: existing } = await supabase
+            .from('user_journey')
+            .select('*')
+            .eq('session_id', session_id)
+            .maybeSingle();
+
+        if (existing) {
+            const updates = { last_seen_at: new Date().toISOString() };
+
+            if (stepMap[event_type]) {
+                const stepOrder = ['visitor', 'signup_started', 'otp_pending', 'registered',
+                    'grant_downloaded', 'form_uploaded', 'face_verified',
+                    'payment_started', 'payment_completed'];
+                const currentIdx = stepOrder.indexOf(existing.current_step || 'visitor');
+                const newIdx = stepOrder.indexOf(stepMap[event_type]);
+                if (newIdx > currentIdx) updates.current_step = stepMap[event_type];
+            }
+
+            Object.entries(flagMap).forEach(([key, flag]) => {
+                if (event_type === key) updates[flag] = true;
+            });
+
+            if (email && !existing.email) updates.email = email;
+            if (full_name && !existing.full_name) updates.full_name = full_name;
+
+            await supabase.from('user_journey').update(updates).eq('id', existing.id);
+        }
+
+        res.json({ success: true });
+    } catch (err) {
+        console.error('❌ Track click:', err.message);
+        res.status(500).json({ success: false });
+    }
+});
+
+// ============================================================
+// ADMIN
+// ============================================================
+
+app.post('/api/admin/login', (req, res) => {
+    const { password } = req.body;
+    if (password === ADMIN_PASSWORD) {
+        res.json({ success: true, message: 'Authenticated' });
+    } else {
+        res.status(401).json({ success: false, message: 'Invalid password' });
+    }
+});
+
+app.get('/api/admin/users', requireAdmin, async (req, res) => {
+    try {
+        const { data: users, error } = await supabase
+            .from('users').select('*').order('created_at', { ascending: false });
+        if (error) throw error;
+
+        const { data: journeys } = await supabase.from('user_journey').select('*');
+
+        const merged = (users || []).map(u => {
+            const j = (journeys || []).find(x => x.email === u.email) || {};
+            return { ...u, journey: j };
+        });
+
+        res.json({ success: true, data: merged });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.get('/api/admin/journeys', requireAdmin, async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('user_journey').select('*')
+            .order('last_seen_at', { ascending: false })
+            .limit(500);
+        if (error) throw error;
+        res.json({ success: true, data: data || [] });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.get('/api/admin/clicks', requireAdmin, async (req, res) => {
+    try {
+        const { source, limit = 200 } = req.query;
+        let q = supabase.from('clicks').select('*')
+            .order('created_at', { ascending: false })
+            .limit(parseInt(limit));
+        if (source) q = q.eq('source_key', source);
+        const { data, error } = await q;
+        if (error) throw error;
+        res.json({ success: true, data: data || [] });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.get('/api/admin/visits', requireAdmin, async (req, res) => {
+    try {
+        const { source, limit = 200 } = req.query;
+        let q = supabase.from('visits').select('*')
+            .order('created_at', { ascending: false })
+            .limit(parseInt(limit));
+        if (source) q = q.eq('source_key', source);
+        const { data, error } = await q;
+        if (error) throw error;
+        res.json({ success: true, data: data || [] });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.get('/api/admin/stats', requireAdmin, async (req, res) => {
+    try {
+        const sources = ['quavo', 'zhus', 'iszo', 'unknown'];
+        const result = {};
+
+        for (const src of sources) {
+            const { count: vc } = await supabase.from('visits').select('*', { count: 'exact', head: true }).eq('source_key', src);
+            const { count: cc } = await supabase.from('clicks').select('*', { count: 'exact', head: true }).eq('source_key', src);
+            const { count: uc } = await supabase.from('user_journey').select('*', { count: 'exact', head: true }).eq('source_key', src);
+            const { count: pc } = await supabase.from('user_journey').select('*', { count: 'exact', head: true }).eq('source_key', src).eq('payment_completed', true);
+
+            result[src] = {
+                visits: vc || 0,
+                clicks: cc || 0,
+                users: uc || 0,
+                payments: pc || 0
+            };
+        }
+
+        res.json({ success: true, data: result });
+    } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
 });
@@ -751,8 +920,10 @@ app.listen(PORT, () => {
     console.log(`🔐 JWT: ${JWT_SECRET ? '✅' : '❌'}`);
     console.log(`🗄️  Supabase: ${process.env.SUPABASE_URL ? '✅' : '❌'}`);
     console.log(`📧 Brevo: ${BREVO_API_KEY ? '✅' : '❌'}`);
-    console.log(`📰 News: ✅ (RSS + og:image)`);
+    console.log(`📰 News: ✅`);
     console.log(`🔎 BTC Cipher: ✅`);
+    console.log(`📊 Tracking: ✅`);
+    console.log(`🔐 Admin: ✅ (password: ${ADMIN_PASSWORD === 'Only-The-Family' ? 'default' : 'custom'})`);
     console.log('========================================');
 });
 

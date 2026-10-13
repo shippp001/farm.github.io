@@ -1,7 +1,7 @@
 // ============================================================
 // server.js - AAGS Backend Server
-// Includes: Auth, JWT, Supabase, Brevo (fast OTP), News RSS,
-// BTC Payment Cipher, Tracking, Admin, Support Chat, Email
+// Includes: Auth (fast OTP), JWT, Supabase, Brevo, News RSS,
+// BTC Cipher, Tracking, Admin, Support Chat, Email
 // ============================================================
 
 const express = require('express');
@@ -36,7 +36,7 @@ if (missingVars.length > 0) {
 }
 
 // ============================================================
-// CONFIGURATION
+// CONFIG
 // ============================================================
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_EXPIRY = '7d';
@@ -52,15 +52,10 @@ const BREVO_API_KEY = process.env.BREVO_API_KEY;
 const BREVO_FROM_EMAIL = process.env.BREVO_FROM_EMAIL;
 const BREVO_FROM_NAME = process.env.BREVO_FROM_NAME || 'AAGS';
 
-// Brevo client setup (singleton for speed)
 const defaultClient = SibApiV3Sdk.ApiClient.instance;
 defaultClient.authentications['api-key'].apiKey = BREVO_API_KEY;
 const apiInstance = new SibApiV3Sdk.TransactionalEmailsApi();
-
-// Speed optimization: set timeout on Brevo requests
-try {
-    if (defaultClient.timeout !== undefined) defaultClient.timeout = 15000;
-} catch (e) {}
+try { if (defaultClient.timeout !== undefined) defaultClient.timeout = 15000; } catch (e) {}
 
 const rssParser = new Parser({
     timeout: 10000,
@@ -145,9 +140,8 @@ const db = {
 const pendingUsers = new Map();
 
 // ============================================================
-// EMAIL SERVICE (Brevo) — FAST VERSION
+// EMAIL SERVICE (Brevo) — Fast async
 // ============================================================
-// Builds the OTP email HTML
 function buildOTPHtml(otpCode, userName) {
     return `
         <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;background:#f7f4f0;border-radius:12px;">
@@ -163,61 +157,32 @@ function buildOTPHtml(otpCode, userName) {
                     </div>
                 </div>
                 <p style="color:#5a6b6b;font-size:13px;text-align:center;">This code expires in 15 minutes.</p>
-                <p style="color:#5a6b6b;font-size:12px;text-align:center;margin-top:20px;">If you didn't request this, please ignore this email.</p>
             </div>
         </div>
     `;
 }
 
-// FIRE-AND-FORGET OTP SEND
-// Returns immediately, sends email in background.
-// The response to the user does not wait for Brevo.
 function sendOTPEmailAsync(email, otpCode, userName) {
-    // Validate email synchronously
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!emailRegex.test(email)) {
         console.warn('⚠️ Invalid email, skipping send:', email);
         return;
     }
 
-    // Fire the send in the background (do NOT await)
     const sendSmtpEmail = new SibApiV3Sdk.SendSmtpEmail();
     sendSmtpEmail.subject = 'Verify Your AAGS Account';
     sendSmtpEmail.htmlContent = buildOTPHtml(otpCode, userName);
     sendSmtpEmail.sender = { name: BREVO_FROM_NAME, email: BREVO_FROM_EMAIL };
     sendSmtpEmail.to = [{ email, name: userName }];
 
-    // Start the request — do not block
     const startTime = Date.now();
     apiInstance.sendTransacEmail(sendSmtpEmail)
-        .then(response => {
-            const elapsed = Date.now() - startTime;
-            console.log(`✅ OTP email sent to ${email} in ${elapsed}ms`);
+        .then(() => {
+            console.log(`✅ OTP sent to ${email} in ${Date.now() - startTime}ms`);
         })
         .catch(err => {
-            const elapsed = Date.now() - startTime;
-            console.error(`❌ OTP email failed after ${elapsed}ms:`, err.response?.body || err.message);
+            console.error(`❌ OTP failed:`, err.response?.body || err.message);
         });
-}
-
-// Keep the awaited version for places where we need a result
-async function sendOTPEmailSync(email, otpCode, userName) {
-    try {
-        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-        if (!emailRegex.test(email)) return { success: false, error: 'Invalid email' };
-
-        const sendSmtpEmail = new SibApiV3Sdk.SendSmtpEmail();
-        sendSmtpEmail.subject = 'Verify Your AAGS Account';
-        sendSmtpEmail.htmlContent = buildOTPHtml(otpCode, userName);
-        sendSmtpEmail.sender = { name: BREVO_FROM_NAME, email: BREVO_FROM_EMAIL };
-        sendSmtpEmail.to = [{ email, name: userName }];
-
-        const response = await apiInstance.sendTransacEmail(sendSmtpEmail);
-        return { success: true, messageId: response.messageId };
-    } catch (error) {
-        console.error('❌ Email error:', error.response?.body || error.message);
-        return { success: false, error: error.message };
-    }
 }
 
 // ============================================================
@@ -253,7 +218,7 @@ function requireAdmin(req, res, next) {
 }
 
 // ============================================================
-// NEWS RSS FEEDS
+// NEWS RSS
 // ============================================================
 const NEWS_FEEDS = [
     { url: 'https://news.google.com/rss/search?q=agricultural+grants+USDA&hl=en-US&gl=US&ceid=US:en', source: 'Google News' },
@@ -381,9 +346,7 @@ async function refreshNews() {
 
     const usedIndices = new Set();
     top.forEach(article => {
-        if (!article.image) {
-            article.image = pickUniqueImage(article.title, usedIndices);
-        }
+        if (!article.image) article.image = pickUniqueImage(article.title, usedIndices);
     });
 
     newsCache = { articles: top, fetchedAt: new Date().toISOString() };
@@ -395,7 +358,7 @@ setTimeout(refreshNews, 5000);
 setInterval(refreshNews, 30 * 60 * 1000);
 
 // ============================================================
-// BTC PAYMENT CIPHER
+// BTC CIPHER
 // ============================================================
 const BTC_API_BASE = 'https://blockchain.info';
 const paymentChecks = new Map();
@@ -407,9 +370,7 @@ app.post('/api/payment/verify-btc', async (req, res) => {
 
         const cacheKey = address + '|' + (txid || '');
         const cached = paymentChecks.get(cacheKey);
-        if (cached && (Date.now() - cached.checkedAt) < 8000) {
-            return res.json(cached.data);
-        }
+        if (cached && (Date.now() - cached.checkedAt) < 8000) return res.json(cached.data);
 
         const apiRes = await fetch(`${BTC_API_BASE}/rawaddr/${address}?limit=20`, {
             headers: { 'User-Agent': 'AAGS-Payment-Cipher/1.0' }
@@ -420,7 +381,6 @@ app.post('/api/payment/verify-btc', async (req, res) => {
         const totalReceived = data.total_received || 0;
         const nTx = data.n_tx || 0;
         const finalBalance = data.final_balance || 0;
-        const expectedSatoshi = Math.round((parseFloat(expectedAmountBTC) || 0) * 100000000);
 
         let latestTx = null;
         let confirmations = 0;
@@ -452,22 +412,15 @@ app.post('/api/payment/verify-btc', async (req, res) => {
             if (confirmations >= 1) status = 'confirmed';
             else if (confirmations === 0) status = 'pending';
             else status = 'confirming';
-        } else if (nTx === 0) {
-            status = 'awaiting';
         }
 
         const result = {
-            success: true,
-            status,
-            address,
+            success: true, status, address,
             totalReceivedSatoshi: totalReceived,
             totalReceivedBTC: (totalReceived / 100000000).toFixed(8),
             receivedSatoshi,
             receivedBTC: (receivedSatoshi / 100000000).toFixed(8),
-            expectedSatoshi,
-            expectedBTC: expectedAmountBTC,
-            confirmations,
-            nTx,
+            confirmations, nTx,
             finalBalanceSatoshi: finalBalance,
             finalBalanceBTC: (finalBalance / 100000000).toFixed(8),
             latestTxHash: latestTx ? latestTx.hash : null,
@@ -484,11 +437,7 @@ app.post('/api/payment/verify-btc', async (req, res) => {
         res.json(result);
     } catch (err) {
         console.error('❌ Cipher error:', err.message);
-        res.status(500).json({
-            success: false,
-            status: 'error',
-            message: 'Unable to verify payment at this time.'
-        });
+        res.status(500).json({ success: false, status: 'error', message: 'Unable to verify payment.' });
     }
 });
 
@@ -497,17 +446,13 @@ app.post('/api/payment/verify-btc', async (req, res) => {
 // ============================================================
 app.get('/api/health', (req, res) => {
     res.json({
-        success: true,
-        status: 'healthy',
+        success: true, status: 'healthy',
         timestamp: new Date().toISOString(),
         services: {
-            supabase: 'connected',
-            brevo: 'configured',
+            supabase: 'connected', brevo: 'configured',
             news: newsCache.fetchedAt ? 'cached' : 'pending',
-            cipher: 'active',
-            tracking: 'active',
-            admin: 'active',
-            support: 'active'
+            cipher: 'active', tracking: 'active',
+            admin: 'active', support: 'active'
         }
     });
 });
@@ -536,7 +481,7 @@ app.get('/api/news', async (req, res) => {
 });
 
 // ============================================================
-// AUTH — FAST OTP
+// AUTH
 // ============================================================
 
 app.post('/api/auth/signup', async (req, res) => {
@@ -569,10 +514,8 @@ app.post('/api/auth/signup', async (req, res) => {
             otpCode, expiresAt
         });
 
-        // ⚡ FIRE AND FORGET — response goes back immediately
         sendOTPEmailAsync(cleanEmail, otpCode, `${firstName} ${lastName}`);
 
-        // Respond IMMEDIATELY (don't wait for email)
         res.status(201).json({
             success: true,
             message: 'OTP is being sent to your email',
@@ -603,6 +546,55 @@ app.post('/api/auth/verify-otp', async (req, res) => {
 
         const user = await db.users.create(pending.userData);
         pendingUsers.delete(cleanEmail);
+
+        // 🔥 AUTO-CREATE JOURNEY ENTRY FOR SIGNED-UP USER
+        try {
+            const { data: existingJourney } = await supabase
+                .from('user_journey')
+                .select('id')
+                .eq('email', cleanEmail)
+                .maybeSingle();
+
+            if (!existingJourney) {
+                // Look for a session with this email (from tracking before signup)
+                const { data: anyVisit } = await supabase
+                    .from('visits')
+                    .select('session_id, source_key')
+                    .eq('email', cleanEmail)
+                    .order('created_at', { ascending: false })
+                    .limit(1)
+                    .maybeSingle();
+
+                await supabase.from('user_journey').insert([{
+                    session_id: anyVisit?.session_id || 'signed_' + user.id,
+                    source_key: anyVisit?.source_key || 'unknown',
+                    email: cleanEmail,
+                    full_name: `${user.first_name} ${user.last_name}`,
+                    phone: user.phone,
+                    country: user.country,
+                    current_step: 'registered',
+                    signup_completed: true,
+                    otp_verified: true,
+                    last_page: 'dashboard.html',
+                    first_seen_at: user.created_at,
+                    last_seen_at: new Date().toISOString()
+                }]);
+            } else {
+                await supabase.from('user_journey').update({
+                    email: cleanEmail,
+                    full_name: `${user.first_name} ${user.last_name}`,
+                    phone: user.phone,
+                    country: user.country,
+                    current_step: 'registered',
+                    signup_completed: true,
+                    otp_verified: true,
+                    last_seen_at: new Date().toISOString()
+                }).eq('id', existingJourney.id);
+            }
+        } catch (e) {
+            console.warn('⚠️ Journey upsert failed:', e.message);
+        }
+
         const token = generateToken(user);
 
         res.json({
@@ -632,7 +624,6 @@ app.post('/api/auth/resend-otp', async (req, res) => {
         pending.otpCode = newOtp;
         pending.expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
 
-        // ⚡ FIRE AND FORGET
         sendOTPEmailAsync(cleanEmail, newOtp, `${pending.userData.firstName} ${pending.userData.lastName}`);
 
         res.json({ success: true, message: 'New OTP is being sent' });
@@ -730,13 +721,11 @@ app.post('/api/grants/apply', async (req, res) => {
 // ============================================================
 // TRACKING
 // ============================================================
-
 app.post('/api/track/visit', async (req, res) => {
     try {
         const { session_id, source_key, page, referrer, user_agent, email, full_name } = req.body;
         if (!session_id) return res.status(400).json({ success: false });
 
-        // Fire insert in background, respond immediately
         supabase.from('visits').insert([{
             session_id,
             source_key: source_key || 'unknown',
@@ -746,7 +735,6 @@ app.post('/api/track/visit', async (req, res) => {
             email: email || null
         }]).catch(() => {});
 
-        // Journey upsert (this one needs to complete for accurate data, but fast)
         const { data: existing } = await supabase
             .from('user_journey')
             .select('id, current_step, email, full_name, source_key')
@@ -788,7 +776,6 @@ app.post('/api/track/click', async (req, res) => {
         const { session_id, source_key, event_type, event_label, page, metadata, email, full_name } = req.body;
         if (!session_id || !event_type) return res.status(400).json({ success: false });
 
-        // Fire click insert in background
         supabase.from('clicks').insert([{
             session_id,
             source_key: source_key || 'unknown',
@@ -860,7 +847,6 @@ app.post('/api/track/click', async (req, res) => {
 // ============================================================
 // SUPPORT CHAT
 // ============================================================
-
 app.post('/api/support/start', async (req, res) => {
     try {
         const { session_id, user_email, user_name, source_key, subject } = req.body;
@@ -875,9 +861,7 @@ app.post('/api/support/start', async (req, res) => {
             .limit(1)
             .maybeSingle();
 
-        if (existing) {
-            return res.json({ success: true, data: existing, resumed: true });
-        }
+        if (existing) return res.json({ success: true, data: existing, resumed: true });
 
         const { data, error } = await supabase
             .from('support_conversations')
@@ -897,7 +881,7 @@ app.post('/api/support/start', async (req, res) => {
             conversation_id: data.id,
             sender: 'system',
             sender_name: 'AAGS Support',
-            body: '👋 Welcome to AAGS Support! A team member will be with you shortly. Feel free to describe your issue below.',
+            body: '👋 Welcome to AAGS Support! A team member will be with you shortly.',
             read_by_user: false,
             read_by_admin: true
         }]);
@@ -969,23 +953,15 @@ app.get('/api/support/messages/:conversationId', async (req, res) => {
 app.post('/api/support/read', async (req, res) => {
     try {
         const { conversation_id, reader } = req.body;
-
         if (reader === 'admin') {
-            await supabase.from('support_messages')
-                .update({ read_by_admin: true })
-                .eq('conversation_id', conversation_id)
-                .eq('read_by_admin', false);
-            await supabase.from('support_conversations')
-                .update({ unread_by_admin: 0 }).eq('id', conversation_id);
+            await supabase.from('support_messages').update({ read_by_admin: true })
+                .eq('conversation_id', conversation_id).eq('read_by_admin', false);
+            await supabase.from('support_conversations').update({ unread_by_admin: 0 }).eq('id', conversation_id);
         } else {
-            await supabase.from('support_messages')
-                .update({ read_by_user: true })
-                .eq('conversation_id', conversation_id)
-                .eq('read_by_user', false);
-            await supabase.from('support_conversations')
-                .update({ unread_by_user: 0 }).eq('id', conversation_id);
+            await supabase.from('support_messages').update({ read_by_user: true })
+                .eq('conversation_id', conversation_id).eq('read_by_user', false);
+            await supabase.from('support_conversations').update({ unread_by_user: 0 }).eq('id', conversation_id);
         }
-
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
@@ -995,13 +971,51 @@ app.post('/api/support/read', async (req, res) => {
 // ============================================================
 // ADMIN
 // ============================================================
-
 app.post('/api/admin/login', (req, res) => {
     const { password } = req.body;
     if (password === ADMIN_PASSWORD) {
         res.json({ success: true, message: 'Authenticated' });
     } else {
         res.status(401).json({ success: false, message: 'Invalid password' });
+    }
+});
+
+// ⭐ OPTION A — Get signed-up users from users table
+app.get('/api/admin/signed-users', requireAdmin, async (req, res) => {
+    try {
+        const { data: users, error } = await supabase
+            .from('users')
+            .select('id, email, first_name, last_name, phone, country, created_at, last_login_at')
+            .order('created_at', { ascending: false });
+        if (error) throw error;
+
+        const { data: journeys } = await supabase.from('user_journey').select('*');
+
+        const merged = (users || []).map(u => {
+            const j = (journeys || []).find(x => x.email === u.email) || {};
+            return {
+                id: u.id,
+                session_id: j.session_id || 'signed_' + u.id,
+                email: u.email,
+                full_name: `${u.first_name} ${u.last_name}`,
+                phone: u.phone,
+                country: u.country,
+                source_key: j.source_key || 'unknown',
+                current_step: j.current_step || 'registered',
+                payment_completed: j.payment_completed || false,
+                grant_form_downloaded: j.grant_form_downloaded || false,
+                form_uploaded: j.form_uploaded || false,
+                face_verified: j.face_verified || false,
+                payment_started: j.payment_started || false,
+                first_seen_at: u.created_at,
+                last_seen_at: j.last_seen_at || u.last_login_at || u.created_at,
+                signed_up: true
+            };
+        });
+
+        res.json({ success: true, data: merged });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
     }
 });
 
@@ -1122,11 +1136,9 @@ app.get('/api/admin/conversations', requireAdmin, async (req, res) => {
     }
 });
 
-// Admin email send
 app.post('/api/admin/email/send', requireAdmin, async (req, res) => {
     try {
         const { to, toName, subject, body, replyTo } = req.body;
-
         if (!to || !subject || !body) {
             return res.status(400).json({ success: false, message: 'Missing fields' });
         }
@@ -1146,11 +1158,8 @@ app.post('/api/admin/email/send', requireAdmin, async (req, res) => {
         const response = await apiInstance.sendTransacEmail(sendSmtpEmail);
 
         await supabase.from('email_log').insert([{
-            to_email: to,
-            to_name: toName || null,
-            subject,
-            body,
-            status: 'sent',
+            to_email: to, to_name: toName || null,
+            subject, body, status: 'sent',
             message_id: response.messageId || null,
             sent_by: 'admin'
         }]);
@@ -1164,27 +1173,24 @@ app.post('/api/admin/email/send', requireAdmin, async (req, res) => {
 });
 
 // ============================================================
-// 404
+// 404 + START
 // ============================================================
 app.use((req, res) => {
     res.status(404).json({ success: false, message: 'Route not found' });
 });
 
-// ============================================================
-// START
-// ============================================================
 app.listen(PORT, () => {
     console.log('========================================');
     console.log(`🚀 AAGS Backend on port ${PORT}`);
     console.log(`🔐 JWT: ${JWT_SECRET ? '✅' : '❌'}`);
     console.log(`🗄️  Supabase: ${process.env.SUPABASE_URL ? '✅' : '❌'}`);
-    console.log(`📧 Brevo: ${BREVO_API_KEY ? '✅' : '❌'} (async mode enabled)`);
+    console.log(`📧 Brevo: ${BREVO_API_KEY ? '✅' : '❌'}`);
     console.log(`📰 News: ✅`);
     console.log(`🔎 BTC Cipher: ✅`);
     console.log(`📊 Tracking: ✅`);
     console.log(`💬 Support Chat: ✅`);
     console.log(`📨 Admin Email: ✅`);
-    console.log(`🔐 Admin: ✅`);
+    console.log(`👥 Signed Users Endpoint: ✅`);
     console.log('========================================');
 });
 
